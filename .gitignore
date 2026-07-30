@@ -1,0 +1,19 @@
+# 参加者がキットを動かすと出来るもの
+starter/.venv/
+notebooks/.ipynb_checkpoints/
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 自分の提出物（リポジトリ直下に作られるもの）。
+# ★先頭の / を外すと participant_data/sample_submissions/ の実例まで無視されるので注意。
+/C.csv
+/F_mia.csv
+/F_aia.csv
+/my_defense.zip
+/my_attack.zip
+/notebooks/C.csv
+/notebooks/F_mia.csv
+/notebooks/F_aia.csv
+
+.DS_Store

@@ -1,0 +1,87 @@
+aia:
+  tau_time: 0.5
+assembler:
+  c: 25
+  n_max: 30
+  private_core_size: 300
+attack:
+  mia_density_estimator: kde
+onset:
+  horizon_years: 10.0
+population:
+  age_range:
+  - 40
+  - 74
+run:
+  n_rare: 3500
+schema:
+  ranges:
+    ALT:
+    - 0.1
+    - 700.0
+    BMI:
+    - 10.0
+    - 55.0
+    FPG:
+    - 40.0
+    - 400.0
+    HDL:
+    - 10.0
+    - 160.0
+    SBP:
+    - 40.0
+    - 250.0
+    TG:
+    - 1.0
+    - 3000.0
+scoring:
+  aia_rare_se_z: 1.64
+  anonymity_breadth_penalty:
+    lambda: 0.0
+    success_threshold: 0.5
+  anonymity_facet_combine: max
+  anonymity_facets:
+  - mia
+  - aia
+  attack_difficulty:
+    scheme: leave_one_out
+  final_combine:
+    scheme: min
+  km_tau_years: 10.0
+  low_fpr: 0.01
+  mia_fold_K: 12
+  mia_fold_normalize: true
+  rmst_tau_years: 5.0
+  round_weights:
+    final: 0.9
+    prelim: 0.1
+  u_rare:
+    aggregate: min
+    c2st:
+      min_rare_n: 8
+      n_estimators: 200
+    markers: null
+    mass_se_z: 2.0
+    min_rare_n: 3
+  u_time:
+    floor_nboot: 200
+    floor_pct: 95
+  u_valid:
+    no_fab:
+      scale: 0.5
+      tol: 0.08
+  utility_aggregation: min
+  utility_core_weights:
+    U_gen: 1.0
+    U_spec: 1.0
+    U_valid: 0.5
+  utility_group:
+  - - U_gen
+    - U_rare
+    - U_valid
+  - - U_spec
+  utility_weights: null
+submission:
+  max_unzipped_mb: 100
+  max_zip_mb: 20
+  token_pattern: ^[A-Za-z0-9]{16,}$

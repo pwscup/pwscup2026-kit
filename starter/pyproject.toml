@@ -1,0 +1,37 @@
+[project]
+name = "pwscup2026-kit"
+version = "2026.7.30"
+description = "PWS Cup 2026 スターターキット: 提出物検証・ローカル自己採点・参照攻撃・参照防御"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+
+# 採点・検証パスが import するものだけ。版は採点 Docker イメージ
+# (hajimeono/pwscup2026-kit:slim-20260728b) と一対一＝ローカル採点とサーバ採点で
+# 数値が食い違わないようにするための固定。厳密に合わせたい場合は
+# requirements-kit.txt（イメージのロックそのもの）を使ってください。
+dependencies = [
+    "numpy==2.4.6",
+    "pandas==2.3.3",
+    "scipy==1.17.1",
+    "scikit-learn==1.9.0",
+    "statsmodels==0.14.6",
+    "lifelines==0.30.3",
+    "matplotlib==3.11.0",
+    "pyyaml==6.0.3",
+]
+
+[project.optional-dependencies]
+# reference/strong_synth.py の arf_synth。arfpy は numpy>=2 で消えた np.in1d を使うため
+# スクリプト側で後方互換パッチを当てています。
+strong-synth = ["arfpy"]
+# reference/strong_synth.py の ctgan_synth。torch を引くので重いです。
+ctgan = ["sdv"]
+# 入門ノートブックを starter 側から動かす場合。
+notebook = ["jupyterlab"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pwscup2026"]
