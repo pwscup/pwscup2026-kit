@@ -24,17 +24,71 @@ from ...scoring import attack_score
 from ...scoring.result import ReportLevel
 from ...scoring.utility import UtilityReference, score_utility
 
+#: 本番参照データの目印。**このファイルが reference_data にあれば本番モード**＝提出の
+#: `token.txt` から team_id を引いて、その提出者向けの参照ファイルを選ぶ。無ければ練習モード
+#: ＝従来どおりの固定ファイル名（`B_practice.csv` 等）を読む。
+#: 本番は 1フェーズ＝1タスク＝1つの reference_data に全参加チームぶんが入るので、
+#: **提出者を見分けないと全員が同じ1チームの B と比べられてしまう**。
+TOKENS_FILE = "tokens.csv"
+
+
+# --------------------------------------------------------------------------- #
+# 提出者の解決（本番モード）
+# --------------------------------------------------------------------------- #
+def is_production_reference(ref_dir: str | Path) -> bool:
+    """reference_data が本番レイアウト（チーム別参照＋`tokens.csv`）か。"""
+    return (Path(ref_dir) / TOKENS_FILE).is_file()
+
+
+def load_token_map(ref_dir: str | Path) -> dict[str, int]:
+    """`tokens.csv`（列 `token,team_id`）を token→team_id で読む。無ければ空辞書。"""
+    p = Path(ref_dir) / TOKENS_FILE
+    if not p.is_file():
+        return {}
+    df = pd.read_csv(p, dtype={"token": str})
+    return {str(t).strip(): int(k) for t, k in zip(df["token"], df["team_id"])}
+
+
+def resolve_team_id(ref_dir: str | Path, token: str | None) -> int | None:
+    """提出の token から team_id を引く。練習モード・未知トークンは None。
+
+    ★未知トークンで採点を続けない（別チームの B と比べる事故を防ぐ）。本番モードで None なら
+    **採点せずに終了**する＝提出回数を消費させない（ルールブック §5.5）。
+    提出物の検証でも同じことを見ているので、通常はここに来る前に弾かれる。
+    """
+    if token is None:
+        return None
+    return load_token_map(ref_dir).get(str(token).strip())
+
+
+def _process_ref_paths(ref_dir: Path, team_id: int | None) -> tuple[Path, Path, Path]:
+    """加工採点で**提出者ごとに変わる**3ファイル (B, utility_ref, pool_ids) のパス。
+
+    練習は固定名、本番はチーム番号つき。`A_bg.csv` と参照攻撃者（`B_ref.csv` /
+    `pool_ids_ref.csv`）は全チーム共通なので、ここでは扱わない。
+    """
+    if team_id is None:
+        return (ref_dir / "B_practice.csv", ref_dir / "utility_ref.json", ref_dir / "pool_ids_practice.csv")
+    return (ref_dir / f"B_{team_id}.csv", ref_dir / f"utility_ref_{team_id}.json",
+            ref_dir / f"pool_ids_{team_id}.csv")
+
 
 # --------------------------------------------------------------------------- #
 # reference_data ローダ
 # --------------------------------------------------------------------------- #
-def load_utility_reference(ref_dir: Path) -> UtilityReference:
-    """reference_data の `utility_ref.json` から `UtilityReference` を復元する。
+def load_utility_reference(ref_dir: Path, team_id: int | None = None) -> UtilityReference:
+    """reference_data の `utility_ref[_k].json` から `UtilityReference` を復元する。
 
     mu/sigma/b_is_rare は配列化、band/scalar はそのまま。事務局が B から計算した値を
     移送しただけで、採点時に再計算はしない。
+
+    ★サーバ側の JSON は `b_is_rare`（真の希少ラベル）を入れて配る。参加者に配る
+    `utility_ref.json` は同じ場所が null で、参加者は同じ値を `B_self.csv` の `is_rare` 列から
+    供給する（真値の受け取り口を1つに絞ってある）。どちらの経路でも同じ値が入るので、
+    ローカル自己採点とサーバ採点は一致する（ルールブック §5.4）。
     """
-    d = json.loads((ref_dir / "utility_ref.json").read_text(encoding="utf-8"))
+    _, util_path, _ = _process_ref_paths(Path(ref_dir), team_id)
+    d = json.loads(util_path.read_text(encoding="utf-8"))
     b_is_rare = d.get("b_is_rare")
     return UtilityReference(
         mu=np.asarray(d["mu"], dtype=float),
@@ -84,29 +138,35 @@ def _membership_truth(candidate_pool_ids: np.ndarray, target_pool_set: set[int])
 # --------------------------------------------------------------------------- #
 # 加工（防御）採点
 # --------------------------------------------------------------------------- #
-def score_process(frames: dict[str, pd.DataFrame], ref_dir: Path, cfg: dict) -> dict:
+def score_process(frames: dict[str, pd.DataFrame], ref_dir: Path, cfg: dict,
+                  team_id: int | None = None) -> dict:
     """防御提出 `C.csv` を採点する（加工タスク）。
 
-    - `utility` = score_utility(C, B_practice, utility_ref, cfg) の集約スカラー。
+    - `utility` = score_utility(C, 提出者のB, utility_ref, cfg) の集約スカラー。
     - `protection` = 1 − 参照攻撃器（overlap_mia）を C にぶつけた membership 露出（score_mia）。
-      候補=`B_ref`、真値=B_ref の pool_id が B_practice の pool 集合に入るか、希少 worst-case 付き。
+      候補=`B_ref`、真値=B_ref の pool_id が**提出者の** pool 集合に入るか、希少 worst-case 付き。
+
+    `team_id=None` は練習モード（固定ファイル名）。本番は `token.txt` から解決した team_id が
+    渡され、提出者ごとに参照を選ぶ。
     """
     ref_dir = Path(ref_dir)
     C = _canonicalize_c(frames["C.csv"])  # 提出順に依存しない正準順（再現性）
 
-    b_practice = pd.read_csv(ref_dir / "B_practice.csv")
+    b_path, _, submitter_pool_path = _process_ref_paths(ref_dir, team_id)
+    b_submitter = pd.read_csv(b_path)
     a_bg = pd.read_csv(ref_dir / "A_bg.csv")
-    util_ref = load_utility_reference(ref_dir)
+    util_ref = load_utility_reference(ref_dir, team_id)
 
-    util = score_utility(C, b_practice, util_ref, cfg, level=ReportLevel.BREAKDOWN)
+    util = score_utility(C, b_submitter, util_ref, cfg, level=ReportLevel.BREAKDOWN)
 
-    # protection: 参照攻撃器 vs 参加者の C（本番匿名性の単体代理・決定(b)）
+    # protection: 参照攻撃器 vs 参加者の C（本番匿名性の単体代理）
+    # ★参照攻撃者には、どのチームにも配っていない余りのコホートを充てる。
     b_ref = pd.read_csv(ref_dir / "B_ref.csv")
     ref_pool = pd.read_csv(ref_dir / "pool_ids_ref.csv")  # record_id, pool_id, is_rare（B_ref行順）
-    practice_pool_set = _pool_set(ref_dir / "pool_ids_practice.csv")
+    submitter_pool_set = _pool_set(submitter_pool_path)
 
     confidence = mia_mod.overlap_mia(C, a_bg, b_ref, cfg)
-    truth = _membership_truth(ref_pool["pool_id"].to_numpy(dtype=int), practice_pool_set)
+    truth = _membership_truth(ref_pool["pool_id"].to_numpy(dtype=int), submitter_pool_set)
     rare_mask = ref_pool["is_rare"].to_numpy(dtype=bool) if "is_rare" in ref_pool else None
     mia_res = attack_score.score_mia(confidence, truth, cfg, rare_mask=rare_mask)
     protection = 1.0 - float(mia_res.score)
@@ -139,18 +199,23 @@ def score_process(frames: dict[str, pd.DataFrame], ref_dir: Path, cfg: dict) -> 
 # --------------------------------------------------------------------------- #
 # 攻撃採点
 # --------------------------------------------------------------------------- #
-def _attacker_pool(ref_dir: Path) -> pd.DataFrame:
-    """攻撃者コホート P の record_id→pool_id/is_rare（F_mia の行キー照合・rare_mask 用）。"""
-    return pd.read_csv(ref_dir / "pool_ids_attacker.csv")  # record_id, pool_id, is_rare
+def _attacker_pool(ref_dir: Path, team_id: int | None = None) -> pd.DataFrame:
+    """攻撃者コホート P の record_id→pool_id/is_rare（F_mia の行キー照合・rare_mask 用）。
+
+    練習は固定名 `pool_ids_attacker.csv`。本番は提出者自身のコホート＝`pool_ids_{team_id}.csv`
+    （対象側と同じファイルを兼用できる＝本番参照データに攻撃者専用のコピーを置かなくてよい）。
+    """
+    name = "pool_ids_attacker.csv" if team_id is None else f"pool_ids_{team_id}.csv"
+    return pd.read_csv(ref_dir / name)  # record_id, pool_id, is_rare
 
 
-def score_mia_power(f_mia: pd.DataFrame, ref_dir: Path, cfg: dict) -> dict:
+def score_mia_power(f_mia: pd.DataFrame, ref_dir: Path, cfg: dict, team_id: int | None = None) -> dict:
     """MIA密行列を採点する。各ターゲット列 k で score_mia を取り、ターゲット平均を power とする。
 
     行キー＝攻撃者コホート P の record_id。列 k のセル＝参加者が申告した membership 確信度。
     真値 O_Pk[r] = pool_id(P 行r) ∈ set(pool_id ∈ target k)。希少 worst-case は score_mia が取る。
     """
-    attacker_pool = _attacker_pool(ref_dir)
+    attacker_pool = _attacker_pool(ref_dir, team_id)
     # F_mia の record_id 順に攻撃者 pool を並べ替え（検証器が行キー一致は保証済）
     ap = attacker_pool.set_index("record_id")
     rid = f_mia["record_id"].to_numpy(dtype=int)
@@ -214,13 +279,17 @@ def score_aia_power(f_aia: pd.DataFrame, ref_dir: Path, cfg: dict) -> dict:
             "all": _nanmean(per_all), "rare": _nanmean(per_rare)}
 
 
-def score_attack(frames: dict[str, pd.DataFrame], ref_dir: Path, cfg: dict) -> dict:
+def score_attack(frames: dict[str, pd.DataFrame], ref_dir: Path, cfg: dict,
+                 team_id: int | None = None) -> dict:
     """攻撃提出（`F_mia.csv`＋`F_aia.csv`）を採点する（攻撃タスク）。
 
     1提出で MIA力・AIA力の2スコア列を返す（攻撃は1提出口）。
+
+    `team_id` は**攻撃者自身**の解決に使う（`F_mia` の行キー＝自分のコホートの record_id）。
+    対象側の `pool_ids_{k}.csv` / `aia_truth_{k}.csv` は元から k 付きなので変わらない。
     """
     ref_dir = Path(ref_dir)
-    mia = score_mia_power(frames["F_mia.csv"], ref_dir, cfg)
+    mia = score_mia_power(frames["F_mia.csv"], ref_dir, cfg, team_id)
     aia = score_aia_power(frames["F_aia.csv"], ref_dir, cfg)
     return {
         "mia_power": mia["power"],

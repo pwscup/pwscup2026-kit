@@ -34,7 +34,7 @@ import numpy as np
 import pandas as pd
 import yaml
 
-from ..scoring.result import ReportLevel
+from ..scoring.result import ReportLevel, json_safe
 from ..scoring.utility import UtilityReference, score_utility
 from . import validate as validate_mod
 from .codabench.scoring_io import _canonicalize_c  # サーバ採点と同一の正準化（単一ソース）
@@ -206,7 +206,8 @@ def main(argv: list[str] | None = None) -> int:
 
     rare_diag = validate_mod.rare_count_diagnostic(c_df, validate_mod.load_dist(args.dist))
     if args.json:
-        print(json.dumps({**out, "b_self": info["b_self"], "rare_gate": rare_diag}, ensure_ascii=False, indent=2))
+        print(json.dumps(json_safe({**out, "b_self": info["b_self"], "rare_gate": rare_diag}),
+                         ensure_ascii=False, indent=2, allow_nan=False))
     else:
         print(_format_report(out, info, rare_diag))
     return 0

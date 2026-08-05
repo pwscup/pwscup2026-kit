@@ -393,6 +393,15 @@ def _onset_raw(x_rare: pd.DataFrame, y_rare: pd.DataFrame, min_rare_n: int) -> f
     return float(np.clip(1.0 - abs(x_rare["onset"].mean() - y_rare["onset"].mean()), 0.0, 1.0))
 
 
+def _canon_rows(df: pd.DataFrame, markers: list[str]) -> np.ndarray:
+    """マーカー値だけで決まる正準行順に並べ替えた行列を返す（＝入力の行順に不変）。
+
+    `np.lexsort` は最後のキーが主キーなので、markers[0] が主キーになるよう逆順に渡す。
+    """
+    m = df[markers].to_numpy(float)
+    return m[np.lexsort(m.T[::-1])]
+
+
 def _c2st_raw(
     x_rare: pd.DataFrame, y_rare: pd.DataFrame, markers: list[str], min_rare_n: int, n_estimators: int
 ) -> float | None:
@@ -401,13 +410,23 @@ def _c2st_raw(
     prof(1-KS=周辺のみ)が見落とす**同時分布/裾依存**を捉える（copulaのガウス依存が苦手な軸）。
     （希少層の同時分布まで見る軸）。
 
-    決定性: RF/CV とも random_state=0、かつ **RF は n_jobs=1**（並列数で加算順が変わり
-    機械をまたぐと結果がぶれるため。下のコメント参照）。データ僅少（n_splits<2）なら
+    決定性: RF/CV とも random_state=0、**RF は n_jobs=1**（下のコメント）、そして
+    **入力の行順に不変**（`_canon_rows` で正準ソートしてから積む）。データ僅少（n_splits<2）なら
     None（較正で除外）。
+
+    ★行順不変が要る理由（2026-08-02）。`StratifiedKFold(shuffle=True)` は行の**位置**で fold を
+    割るので、同じ行集合でも並びが違えば別の分割になり AUC が動く。U_rare の joint 軸は
+    `c2st_cal = c2st_val ÷ c2st_base` で、val は **C 側＝内容ソートで正準化された並び**
+    （`kit.codabench.scoring_io._canonicalize_c`）、base は **B 側＝配布時の並び**（恣意的で
+    チームごとに違う）。∴ 正準化しないと **C=B の完璧な提出でも比が 1 にならない**。
+    本番規模の実測で identity の U_rare が **0.524〜1.000** に振れ（36.7% の並びが 0.95 未満）、
+    加工の巧拙と無関係なオフセットが各チームの U の天井を決めていた。C2ST の AUC は2標本の
+    **集合としての**性質なので、正準順を1つ選んでも指標の意味は変わらない。
+    memory: pwscup2026-c2st-row-order-0802。
     """
     if len(x_rare) < min_rare_n or len(y_rare) < min_rare_n:
         return None
-    X = np.vstack([x_rare[markers].to_numpy(float), y_rare[markers].to_numpy(float)])
+    X = np.vstack([_canon_rows(x_rare, markers), _canon_rows(y_rare, markers)])
     y = np.concatenate([np.ones(len(x_rare)), np.zeros(len(y_rare))])
     n_splits = min(5, int(y.sum()), int((1 - y).sum()))
     if n_splits < 2:
@@ -644,39 +663,13 @@ def _score_u_valid(c: pd.DataFrame, b: pd.DataFrame, cfg: dict) -> tuple[float, 
     return facet, detail
 
 
-def _aggregate(facets: dict[str, float], cfg: dict) -> float:
-    """facetsを合成する。`scoring.utility_aggregation` で方式選択。
+def _aggregate(facets: dict[str, float]) -> float:
+    """4観点を **完全 min-4** で合成する。ルールブック §6.1 の公表式。
 
-    - "min"(現行): **完全min-4** `U=min(U_gen,U_spec,U_rare,U_valid)`。
-      4観点を対等に扱い、一番低い観点がそのまま有用性になる（得意な観点で苦手を埋め合わせられない）。
-      ルールブック §6.1 の公表式。
-    - "mean"(旧): `utility_weights` による加重平均（null=等重み）。
-    - "rare_gate"(旧): U_rare を独立軸に昇格し score = min(U_rare, core)。
-      core = `utility_core_weights` による {U_gen,U_spec,U_valid} の加重平均（U_valid は識別力最小・
-      飽和のため軽く＝既定0.5）。round_score の min(score, A) と合わせ **main = min(U_rare, core, A)**
-      ＝「希少を取れるか」を勝敗の鍵に。stress-testで、A(aia)束縛下ではU内の重み変更は
-      不可視（ρ=1.000）で、min独立軸化のみがU_rareを効かせると実測。
+    `U = min(U_gen, U_spec, U_rare, U_valid)`。4観点を対等に扱い、一番低い観点がそのまま
+    有用性になる（得意な観点で苦手を埋め合わせられない）。
     """
-    mode = cfg["scoring"].get("utility_aggregation", "mean")
-    if mode == "min":
-        return float(min(facets.values()))
-    if mode == "rare_gate":
-        rare = facets["U_rare"]
-        core_facets = {k: v for k, v in facets.items() if k != "U_rare"}
-        cw = cfg["scoring"].get("utility_core_weights") or {}
-        total_w = sum(cw.get(k, 0.0) for k in core_facets)
-        if total_w > 0:
-            core = float(sum(core_facets[k] * cw.get(k, 0.0) for k in core_facets) / total_w)
-        else:
-            core = float(np.mean(list(core_facets.values())))
-        return float(min(rare, core))
-    weights = cfg["scoring"].get("utility_weights")
-    if not weights:
-        return float(np.mean(list(facets.values())))
-    total_w = sum(weights.get(k, 0.0) for k in facets)
-    if total_w <= 0:
-        return float(np.mean(list(facets.values())))
-    return float(sum(facets[k] * weights.get(k, 0.0) for k in facets) / total_w)
+    return float(min(facets.values()))
 
 
 def score_utility(
@@ -708,7 +701,7 @@ def score_utility(
         "U_rare": rare_score,
         "U_valid": valid_score,
     }
-    score = _aggregate(facets, cfg)
+    score = _aggregate(facets)
 
     detail: dict | None = None
     if level in (ReportLevel.BREAKDOWN, ReportLevel.PER_RECORD):

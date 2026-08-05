@@ -63,7 +63,22 @@ def aia_predict(
             idx = all_idx
         d = np.sqrt(np.mean((c_cont[idx] - q_cont[i]) ** 2, axis=1))
         kk = min(k, len(idx))
-        nn = idx if kk >= len(idx) else idx[np.argpartition(d, kk - 1)[:kk]]
-        onset_conf[i] = float(np.mean(c_onset[nn]))
-        time_hat[i] = float(c_time[idx[np.argmin(d)]])
+        if kk >= len(idx):
+            nn = idx
+        else:
+            # ★同値をまとめる（2026-08-01）。`argpartition` で先頭 k 件だけを取ると、
+            # k 番目の距離に同値が並んだとき **どれが選ばれるかが C_i の行順で決まる**。
+            # ＝提出CSVの並べ方で攻撃の成績が動く。k 番目と等しい距離は全部入れる。
+            kth = np.partition(d, kk - 1)[kk - 1]
+            nn = idx[d <= kth]
+        # ★平均を取る前に**値でソートする**。同値の集合は行順に依らず同じでも、
+        # 足す順序が変われば浮動小数の最下位ビットが動く（実測 8.9e-16）。
+        # 判定は `|time_hat − 真値| ≤ 0.5年` の閾値比較なので、最下位ビットの差が
+        # 境目で結果を裏返しうる（C2ST が n_jobs でコア数依存になっていたのと同じ形）。
+        onset_conf[i] = float(np.mean(np.sort(c_onset[nn])))
+        # ★同値をまとめる。最近傍が複数いるときに「先頭の1人」を選ばず、全員の time を平均する。
+        # QI が連続値で揃っている本番設定では最近傍は常に一意（実測で候補は中央値1・最大1）
+        # なので値は変わらない。効くのは、加工が QI を粗く丸めて同じ値の人を大量に作った場合だけ。
+        nearest = idx[d <= d.min()]
+        time_hat[i] = float(np.mean(np.sort(c_time[nearest])))
     return onset_conf, time_hat
