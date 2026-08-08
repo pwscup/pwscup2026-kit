@@ -435,9 +435,10 @@ def check_token_registered(token: str | None, dist_dir: str | Path | None) -> li
     `dist_dir` に `tokens.csv`（列 `token,team_id`）があれば本番参照データ＝一致を要求する。
     無ければ練習・参加者手元なので**何も検査しない**（参加者は tokens.csv を持たない）。
 
-    ★2026-08-04 Ono 決定: 未知トークンの提出は**提出回数を消費させない**。CodaBench 側で
-    "Failed" にする必要があるので、採点ではなく**検証で落とす**（`run._run` が非ゼロ終了する）。
-    ルールブック §5.5 と同じ扱い。★正しいトークンが何かは示さない（総当たりの手掛かりにしない）。
+    未知のトークンでの提出は**提出回数を消費しません**。CodaBench 側で "Failed" に
+    する必要があるため、採点ではなく**検証で落とします**（`run._run` が非ゼロ終了します）。
+    ルールブック §5.5 と同じ扱いです。★正しいトークンが何かは示しません
+    （総当たりの手掛かりにしないため）。
     """
     if dist_dir is None or token is None:
         return []
