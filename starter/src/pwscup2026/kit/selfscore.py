@@ -19,7 +19,7 @@
 CLI:
     python -m pwscup2026.kit.selfscore <C.csv または 提出zip> --dist <participant_data> [--json]
 Docker:
-    docker run --rm -v "$PWD":/w hajimeono/pwscup2026-kit:slim-20260728b score /w/C.csv --dist /w
+    docker run --rm -v "$PWD":/w hajimeono/pwscup2026-kit:prelim-process-20260808 score /w/C.csv --dist /w
 """
 from __future__ import annotations
 

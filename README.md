@@ -6,7 +6,7 @@
 
 - 公式ページ: <https://www.iwsec.org/pws/2026/cup26.html>
 - 参加登録: 公式ページの参加申込フォームから（説明会 7/30 から予備戦終了まで受付）
-- 提出先: CodaBench（コンペページのURLは公式ページで案内します）
+- 提出先: [CodaBench](https://www.codabench.org/competitions/17698)
 - 問い合わせ: pwscup2026-info (at) csec.ipsj.or.jp
 
 ---
@@ -15,14 +15,14 @@
 
 | パス | 何か |
 |---|---|
-| `rulebook/PWS_Cup2026_ルールブック_orientation-20260730c.pdf` | **競技ルールの正本**。得点の定義・提出様式・禁止事項 |
+| `rulebook/PWS_Cup2026_ルールブック_prelim-process-20260808.pdf` | **競技ルールの正本**。得点の定義・提出様式・禁止事項 |
 | `participant_data/` | **練習用データ一式**。下の「配布データ」参照 |
-| `notebooks/` | **教材（任意）**。「はじめてのPWSCup」＝提出まで1周／「採点のしくみ」＝点数の中身 |
+| `notebooks/` | **教材（任意）**。ノートブック2本（「はじめてのPWSCup」＝提出まで1周／「採点のしくみ」＝点数の中身）と、**読みもの2本**（コードなし） |
 | `starter/` | **コード**。提出物の検証器・ローカル自己採点・参照攻撃・参照防御 |
-| Docker イメージ | `hajimeono/pwscup2026-kit:slim-20260728b`（Docker Hub・public・amd64/arm64）。**Python 環境なしで検証と自己採点ができます** |
+| Docker イメージ | `hajimeono/pwscup2026-kit:prelim-process-20260808`（Docker Hub・public・amd64/arm64）。**Python 環境なしで検証と自己採点ができます** |
 | `LICENSE` | コードのライセンス（Apache-2.0） |
 
-**リポジトリごとダウンロードする場合**は、GitHub の緑の「Code」→「Download ZIP」が手軽です。
+**リポジトリごとダウンロードする場合**は、[Releases](https://github.com/pwscup/pwscup2026-kit/releases) の先頭（`Latest` が付いているもの）から `Source code (zip)` を落としてください。Releases はフェーズごとに中身を固定してあるので、**あとから同じ状態を取り直せます**。そのフェーズのルールブック PDF も一緒に付いています。
 
 ### 配布データ（`participant_data/`）
 
@@ -47,12 +47,13 @@
 
 ## いちばん短い道: ノートブック
 
-**読むだけなら GitHub 上でそのまま表示されます**——[`notebooks/はじめてのPWSCup.ipynb`](notebooks/はじめてのPWSCup.ipynb) / [`notebooks/採点のしくみ.ipynb`](notebooks/採点のしくみ.ipynb)。
+**読むだけなら GitHub 上でそのまま表示されます**——[`notebooks/はじめてのPWSCup.ipynb`](notebooks/はじめてのPWSCup.ipynb) / [`notebooks/採点のしくみ.ipynb`](notebooks/採点のしくみ.ipynb)。下の読みものは markdown なので、動かす準備も要りません。
 
 | ノートブック | 中身 | 所要 |
 |---|---|---|
 | はじめてのPWSCup | データの読み方 → 素朴な匿名化 → 自己採点 → 素朴な攻撃 → 提出物の書き出し | 20〜30 分 |
 | 採点のしくみ | 4観点が何を測っているか・**どの操作で点が上下するか**を、加工を作りながら確かめる | 15〜20 分 |
+| [読みもの] 競技データはどう作られているか | 合成データの材料と作り方のうち、開示する範囲（コードなし） | 5 分 |
 
 実行環境は `starter/` に一本化しています（採点器と同じ版のライブラリで動くので、ノートブックの中で出る点数がそのままサーバの点数になります）。
 
@@ -72,15 +73,15 @@ uv run jupyter lab ..
 
 ```sh
 # 提出 zip の形式チェック
-docker run --rm -v "$PWD":/w hajimeono/pwscup2026-kit:slim-20260728b \
+docker run --rm -v "$PWD":/w hajimeono/pwscup2026-kit:prelim-process-20260808 \
   validate /w/my_defense.zip --dist /w/participant_data
 
 # 有用性の自己採点（U と4観点の内訳）
-docker run --rm -v "$PWD":/w hajimeono/pwscup2026-kit:slim-20260728b \
+docker run --rm -v "$PWD":/w hajimeono/pwscup2026-kit:prelim-process-20260808 \
   score /w/C.csv --dist /w/participant_data
 ```
 
-**★ タグ `slim-20260728b` を省略しないでください。** `:latest` は古い版を指しており、`U_rare` がサーバ採点とわずかにずれます。
+**★ タグ `prelim-process-20260808` を省略しないでください。** `:latest` はフェーズが進むと別のイメージを指すようになります。タグを書いておけば、あとで同じ点数を再現できます。
 
 ### Python（`starter/` を入れる）
 
@@ -135,6 +136,14 @@ my_defense.zip
 └── token.txt
 ```
 
+**★ 提出したら、リーダーボードに載せてください。** CodaBench は提出しただけでは
+リーダーボードに載りません。提出一覧（My Submissions）の Actions 列のいちばん左のアイコン
+（マウスを重ねると **Add to Leaderboard** と出ます）を押します。載っている提出はその列が
+緑のチェックに変わります。**加工・攻撃のどちらのフェーズでも、順位の計算に使われるのは、
+そのフェーズ終了時点でリーダーボードに載せている1件だけ**です。1件も載せずに終わった場合は
+事務局が最新の有効な提出をあとから掲載しますが（ルールブック §5.3）、「最新」が自分の
+いちばん良い提出とは限りません。**出したいものは自分で載せてください。**
+
 参照防御をそのまま回すと、有用性の4観点のうち **U_spec（特定の解析での結論一致）が最も低く出ます**。`--method copula_synth`（転帰を共変量と独立に引く素朴版）と見比べると、4観点が何を見ているかが分かります。**この比較は `notebooks/採点のしくみ.ipynb` で実際に採点しながら確かめられます。**
 
 ### 強い合成器（任意・追加依存）
@@ -157,6 +166,6 @@ uv run python reference/strong_synth.py --dist ../participant_data --method ctga
 - **コード**（`starter/` 以下）: Apache-2.0（`LICENSE`）
 - **データとルールブック**: 参加・成果発表・研究・教育目的での利用を許諾します。第三者への再配布の条件は追ってご案内します。
 
-データの生成方法（世界生成のコード）は競技の公平性のため非公開です。生成方法の開示範囲はルールブックに記載しています。
+データの生成方法（世界生成のコード）は競技の公平性のため非公開です。作り方のうち開示する範囲は [`notebooks/データはどう作られているか.md`](notebooks/データはどう作られているか.md) にまとめています。
 
 © 2026 PWS Cup 2026 事務局（情報処理学会 コンピュータセキュリティ研究会 PWS組織委員会）
