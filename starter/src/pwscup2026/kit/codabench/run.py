@@ -43,6 +43,7 @@ from pathlib import Path
 import numpy as np
 import yaml
 
+from ...scoring.result import json_safe
 from ..validate import validate_submission_dir
 from . import scoring_io
 
@@ -70,7 +71,11 @@ def _load_cfg(ref_dir: Path) -> dict:
 
 def _write_outputs(output_dir: Path, scores: dict[str, float], detail_html: str) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / "scores.json").write_text(json.dumps(scores), encoding="utf-8")
+    # ★非有限値は null へ（`tpr_rare` は希少層に陽性が居ないと NaN になる）。
+    # `json.dumps` は既定で `NaN` を書くが、それは JSON として不正＝参加者側のパーサで壊れる。
+    (output_dir / "scores.json").write_text(
+        json.dumps(json_safe(scores), allow_nan=False), encoding="utf-8"
+    )
     # ★日本語を数値文字参照へ。CodaBench は detailed_results.html を charset 宣言
     # 無しで表示するため、ブラウザが既定（windows-1252）で解釈して文字化けする（実測）。
     # 出力を純ASCIIにすればどの charset で読まれても同じに描画される＝宣言に依存しない。
@@ -79,8 +84,15 @@ def _write_outputs(output_dir: Path, scores: dict[str, float], detail_html: str)
 
 
 def _detail_ok(title: str, named: dict[str, float], named_keys: list[str | None],
-               leaderboard: dict[str, float], breakdown: dict) -> str:
-    """検証OKの詳細結果。正式指標名を見出し付きで示し、リーダーボード列との対応も明記。"""
+               leaderboard: dict[str, float], breakdown: dict, team_id: int | None = None) -> str:
+    """検証OKの詳細結果。正式指標名を見出し付きで示し、リーダーボード列との対応も明記。
+
+    `team_id` が解決できた本番採点では**どのチームとして採点したか**を出す。参加者が
+    自分のチームIDと突き合わせられる＝取り違えに気づける（2026-08-04）。
+    """
+    who = (f"<p>この提出は <b>チームID {team_id}</b> のものとして採点しました"
+           f"（token.txt から判定）。配布物の README に書かれた自分のチームIDと違う場合は"
+           f"事務局へ連絡してください。</p>") if team_id is not None else ""
     cells = []
     for lk, nk in zip(LEADERBOARD_KEYS, named_keys):
         if nk:
@@ -90,9 +102,10 @@ def _detail_ok(title: str, named: dict[str, float], named_keys: list[str | None]
             cells.append(f"<tr><td>{escape(lk)}</td>"
                          f"<td>（この提出種別では該当なし）</td><td>―</td></tr>")
     rows = "".join(cells)
-    bd = escape(json.dumps(breakdown, ensure_ascii=False, indent=2))
+    bd = escape(json.dumps(json_safe(breakdown), ensure_ascii=False, indent=2, allow_nan=False))
     return (
-        f"<h2>{escape(title)}</h2><p>検証OK・採点完了。リーダーボードは汎用6列(score_1〜score_6)ですが、"
+        f"<h2>{escape(title)}</h2>{who}"
+        f"<p>検証OK・採点完了。リーダーボードは汎用6列(score_1〜score_6)ですが、"
         f"下表のとおりこのフェーズでの正式な指標に対応します。</p>"
         f"<table border=1 cellpadding=4><tr><th>LB列</th><th>指標</th><th>値</th></tr>{rows}</table>"
         f"<h3>内訳</h3><pre>{bd}</pre>"
@@ -119,9 +132,9 @@ def _map_to_leaderboard(kind: str, out: dict) -> tuple[dict[str, float], dict[st
     return leaderboard, named, named_keys
 
 
-def _score(kind: str, frames: dict, ref_dir: Path, cfg: dict) -> dict:
-    return scoring_io.score_process(frames, ref_dir, cfg) if kind == "defense" \
-        else scoring_io.score_attack(frames, ref_dir, cfg)
+def _score(kind: str, frames: dict, ref_dir: Path, cfg: dict, team_id: int | None = None) -> dict:
+    return scoring_io.score_process(frames, ref_dir, cfg, team_id) if kind == "defense" \
+        else scoring_io.score_attack(frames, ref_dir, cfg, team_id)
 
 
 def _run(mode: str, input_dir: str, output_dir: str) -> int:
@@ -150,8 +163,22 @@ def _run(mode: str, input_dir: str, output_dir: str) -> int:
         print("NG:", "; ".join(errors))
         return 1
 
+    # ★本番参照データ（`tokens.csv` 同梱）なら、提出者を token から解決して参照を選ぶ。
+    #   練習参照データには tokens.csv が無いので team_id=None ＝従来どおりの固定名で読む。
+    #   未知トークンは検証層で弾かれるが、二重の保険としてここでも採点に入らずに落とす
+    #   （非ゼロ終了＝CodaBench で Failed＝提出回数を消費しない）。2026-08-04。
+    team_id: int | None = None
+    if scoring_io.is_production_reference(ref_dir):
+        team_id = scoring_io.resolve_team_id(ref_dir, pkg.token)
+        if team_id is None:
+            msg = ("token.txt が登録されているトークンと一致しません。"
+                   "配布物に同梱された token.txt をそのまま提出物に入れてください。")
+            _write_outputs(out_dir, {k: 0.0 for k in LEADERBOARD_KEYS}, _detail_ng(title, [msg]))
+            print("NG:", msg)
+            return 1
+
     try:
-        out = _score(kind, pkg.frames, ref_dir, cfg)
+        out = _score(kind, pkg.frames, ref_dir, cfg, team_id)
     except Exception as exc:  # noqa: BLE001
         # 採点器の例外でCodaBenchジョブを落とさない（落ちるとrejectにもならず異常終了する）。
         # スコア0＋理由をdetailedに出す。
@@ -161,7 +188,7 @@ def _run(mode: str, input_dir: str, output_dir: str) -> int:
         return 1  # 採点できなかった提出も回数を消費させない（上と同じ理由）
     leaderboard, named, named_keys = _map_to_leaderboard(kind, out)
     _write_outputs(out_dir, leaderboard,
-                   _detail_ok(title, named, named_keys, leaderboard, out.get("_breakdown", {})))
+                   _detail_ok(title, named, named_keys, leaderboard, out.get("_breakdown", {}), team_id))
     print("OK:", json.dumps(leaderboard))
     return 0
 

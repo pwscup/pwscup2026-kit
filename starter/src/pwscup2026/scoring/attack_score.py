@@ -10,18 +10,27 @@ from .result import AttackResult, ReportLevel
 
 
 def _tpr_at_fpr(confidence: np.ndarray, truth: np.ndarray, target_fpr: float) -> tuple[float, float]:
-    """ROC点を作りtarget_fprでのTPRを線形補間する。AUCも返す。陽性/陰性いずれか無しは退化扱い。"""
-    order = np.argsort(-confidence)
+    """ROC点を作りtarget_fprでのTPRを線形補間する。AUCも返す。陽性/陰性いずれか無しは退化扱い。
+
+    **同じ確信度の行はひとつの動作点にまとめる**（`sklearn.roc_curve` と同じ）。まとめないと
+    同値の塊の中の並び順＝提出CSVの行順が結果を左右し、全行に同じ値を出した提出の TPR が
+    行の並べ方次第で 0 にも 1 にもなってしまう。ルールブック §6.2.1 が約束している
+    「同じ値を出すと ROC が対角線になり、FPR=0.01 の TPR も偶然の水準になる」を成立させるため、
+    ここで同値をまとめる。
+    """
+    order = np.argsort(-confidence, kind="mergesort")
+    c = confidence[order]
     y = truth[order]
     n_pos = int(y.sum())
     n_neg = len(y) - n_pos
     if n_pos == 0 or n_neg == 0:
         return 0.0, 0.5
 
-    tp = np.cumsum(y)
-    fp = np.cumsum(1 - y)
-    tpr = np.concatenate([[0.0], tp / n_pos])
-    fpr = np.concatenate([[0.0], fp / n_neg])
+    idx = np.r_[np.flatnonzero(np.diff(c) != 0), len(c) - 1]  # 同値塊の末尾だけを動作点にする
+    tp = np.cumsum(y)[idx]
+    fp = np.cumsum(1 - y)[idx]
+    tpr = np.r_[0.0, tp / n_pos]
+    fpr = np.r_[0.0, fp / n_neg]
     tpr_at = float(np.interp(target_fpr, fpr, tpr))
     auc = float(np.trapezoid(tpr, fpr))
     return tpr_at, auc

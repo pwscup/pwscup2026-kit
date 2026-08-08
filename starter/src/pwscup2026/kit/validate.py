@@ -429,6 +429,29 @@ def check_package_dir(res_dir: str | Path, cfg: dict) -> PackageResult:
     return PackageResult(len(errors) == 0, errors, kind, frames, token)
 
 
+def check_token_registered(token: str | None, dist_dir: str | Path | None) -> list[str]:
+    """`token.txt` が登録済みトークンかを検査する（本番の reference_data に対してのみ効く）。
+
+    `dist_dir` に `tokens.csv`（列 `token,team_id`）があれば本番参照データ＝一致を要求する。
+    無ければ練習・参加者手元なので**何も検査しない**（参加者は tokens.csv を持たない）。
+
+    未知のトークンでの提出は**提出回数を消費しません**。CodaBench 側で "Failed" に
+    する必要があるため、採点ではなく**検証で落とします**（`run._run` が非ゼロ終了します）。
+    ルールブック §5.5 と同じ扱いです。★正しいトークンが何かは示しません
+    （総当たりの手掛かりにしないため）。
+    """
+    if dist_dir is None or token is None:
+        return []
+    p = Path(dist_dir) / "tokens.csv"
+    if not p.is_file():
+        return []
+    known = set(pd.read_csv(p, dtype={"token": str})["token"].astype(str).str.strip())
+    if str(token).strip() in known:
+        return []
+    return ["token.txt: 登録されているトークンと一致しません"
+            "（配布物に同梱された token.txt をそのまま入れてください）"]
+
+
 def _run_layer2(kind: str, frames: dict[str, pd.DataFrame], cfg: dict, dist: dict | None) -> list[str]:
     """層2（提出種別の論理検証）。zip版・dir版で共有。"""
     if kind == "defense":
@@ -453,7 +476,8 @@ def validate_submission_dir(
         return ValidationResult(False, list(pkg.errors)), pkg
     kind = kind_override or pkg.kind
     dist = load_dist(dist_dir) if dist_dir else None
-    errors = list(pkg.errors) + _run_layer2(kind, pkg.frames, cfg, dist)
+    errors = list(pkg.errors) + check_token_registered(pkg.token, dist_dir) \
+        + _run_layer2(kind, pkg.frames, cfg, dist)
     return ValidationResult(len(errors) == 0, errors), pkg
 
 

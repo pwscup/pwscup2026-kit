@@ -4,10 +4,6 @@
 # 値の意味はルールブック §3・§5・§6 を参照。
 aia:
   tau_time: 0.5
-assembler:
-  c: 25
-  n_max: 30
-  private_core_size: 300
 attack:
   mia_density_estimator: kde
 onset:
@@ -16,8 +12,6 @@ population:
   age_range:
   - 40
   - 74
-run:
-  n_rare: 3500
 schema:
   ranges:
     ALT:
@@ -40,21 +34,12 @@ schema:
     - 3000.0
 scoring:
   aia_rare_se_z: 1.64
-  anonymity_breadth_penalty:
-    lambda: 0.0
-    success_threshold: 0.5
-  anonymity_facet_combine: max
   anonymity_facets:
   - mia
   - aia
-  attack_difficulty:
-    scheme: leave_one_out
-  final_combine:
-    scheme: min
   km_tau_years: 10.0
   low_fpr: 0.01
   mia_fold_K: 12
-  mia_fold_normalize: true
   rmst_tau_years: 5.0
   round_weights:
     final: 0.9
@@ -74,17 +59,6 @@ scoring:
     no_fab:
       scale: 0.5
       tol: 0.08
-  utility_aggregation: min
-  utility_core_weights:
-    U_gen: 1.0
-    U_spec: 1.0
-    U_valid: 0.5
-  utility_group:
-  - - U_gen
-    - U_rare
-    - U_valid
-  - - U_spec
-  utility_weights: null
 submission:
   max_unzipped_mb: 100
   max_zip_mb: 20

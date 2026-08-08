@@ -87,16 +87,19 @@ def to_distributed(cohort_df: pd.DataFrame, cfg: dict) -> tuple[pd.DataFrame, di
     return distributed_df, truth_map
 
 
-def _max_rows(cfg: dict) -> int:
-    """コホート行数の上限。多数派骨格 n=|P_i|+(N_max−1)·c ＋ 希少供給 `run.n_rare` を
-    安全マージンとして加える。
+#: 配布 B_i の行数が分からないとき（`--dist` を付けない自己チェック）だけに使う**緩い**行数上限。
+#: 多数派骨格 n=|P_i|+(N_max−1)·c に、希少供給の全体を安全マージンとして足した値。
+#: 実際の B_i は 1,049 行なので4倍以上の余裕がある＝**過剰棄却しないための安全弁**であって、
+#: 「このくらいの行数まで出してよい」という意味の数字ではない。
+#: 本番の提出は配布 B_i の行数と**厳密一致**が要求される（ルールブック §5.1）。
+MAX_ROWS_SELFCHECK = 300 + (30 - 1) * 25 + 3500
 
-    骨格式は多数派だけの近似なので、実際の B_i は希少個体が非共有・共有ブロックへ
-    追加された分だけこれを超える。配布 config だけからは正確な追加数を計算できないため、
-    希少供給の全体をそのまま加えて過剰棄却を避けている（1チームの希少追加数が系全体の
-    供給を超えることはない）。
-    """
-    acfg = cfg["assembler"]
+
+def _max_rows(cfg: dict) -> int:
+    """コホート行数の上限。config に骨格値があればそれで計算し、無ければ上の定数を使う。"""
+    acfg = cfg.get("assembler")
+    if not acfg or "private_core_size" not in acfg:
+        return int(MAX_ROWS_SELFCHECK)
     base = acfg["private_core_size"] + (acfg["n_max"] - 1) * acfg["c"]
     rare_margin = int(cfg.get("run", {}).get("n_rare", 0))
     return int(base + rare_margin)
