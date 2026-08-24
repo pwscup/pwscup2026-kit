@@ -28,7 +28,7 @@ CodaBench の提出は zip のみ。そのまま提出できる例zip:
 [ローカルでの自己採点]
 B_self.csv は B_practice.csv に真値 is_rare 列を足した「自己採点用の拡張版B」です。
 有用性はサーバに出さなくても手元で採点できます（CodaBenchと同じ点数。participant_data/ をカレントディレクトリにして実行）:
-  docker run --rm -v "$PWD":/w hajimeono/pwscup2026-kit:prelim-process-20260808 score /w/C.csv --dist /w
+  docker run --rm -v "$PWD":/w hajimeono/pwscup2026-kit:prelim-attack-20260825 score /w/C.csv --dist /w
 utility_ref.json・scoring_config.yaml は採点器が使う参照値とパラメータです（消さないでください）。
 ※保護(protection)・攻撃力は他チームの情報が要るため手元では採点できません（サーバのみ）。
 

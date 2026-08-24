@@ -15,11 +15,11 @@
 
 | パス | 何か |
 |---|---|
-| `rulebook/PWS_Cup2026_ルールブック_prelim-process-20260808.pdf` | **競技ルールの正本**。得点の定義・提出様式・禁止事項 |
+| `rulebook/PWS_Cup2026_ルールブック_prelim-attack-20260825.pdf` | **競技ルールの正本**。得点の定義・提出様式・禁止事項 |
 | `participant_data/` | **練習用データ一式**。下の「配布データ」参照 |
 | `notebooks/` | **教材（任意）**。ノートブック2本（「はじめてのPWSCup」＝提出まで1周／「採点のしくみ」＝点数の中身）と、**読みもの1本**（コードなし） |
 | `starter/` | **コード**。提出物の検証器・ローカル自己採点・参照攻撃・参照防御 |
-| Docker イメージ | `hajimeono/pwscup2026-kit:prelim-process-20260808`（Docker Hub・public・amd64/arm64）。**Python 環境なしで検証と自己採点ができます** |
+| Docker イメージ | `hajimeono/pwscup2026-kit:prelim-attack-20260825`（Docker Hub・public・amd64/arm64）。**Python 環境なしで検証と自己採点ができます** |
 | `LICENSE` | コードのライセンス（Apache-2.0） |
 
 **リポジトリごとダウンロードする場合**は、[Releases](https://github.com/pwscup/pwscup2026-kit/releases) の先頭（`Latest` が付いているもの）から `Source code (zip)` を落としてください。Releases はフェーズごとに中身を固定してあるので、**あとから同じ状態を取り直せます**。そのフェーズのルールブック PDF も一緒に付いています。
@@ -73,15 +73,15 @@ uv run jupyter lab ..
 
 ```sh
 # 提出 zip の形式チェック
-docker run --rm -v "$PWD":/w hajimeono/pwscup2026-kit:prelim-process-20260808 \
+docker run --rm -v "$PWD":/w hajimeono/pwscup2026-kit:prelim-attack-20260825 \
   validate /w/my_defense.zip --dist /w/participant_data
 
 # 有用性の自己採点（U と4観点の内訳）
-docker run --rm -v "$PWD":/w hajimeono/pwscup2026-kit:prelim-process-20260808 \
+docker run --rm -v "$PWD":/w hajimeono/pwscup2026-kit:prelim-attack-20260825 \
   score /w/C.csv --dist /w/participant_data
 ```
 
-**★ タグ `prelim-process-20260808` を省略しないでください。** `:latest` はフェーズが進むと別のイメージを指すようになります。タグを書いておけば、あとで同じ点数を再現できます。
+**★ タグ `prelim-attack-20260825` を省略しないでください。** `:latest` はフェーズが進むと別のイメージを指すようになります。タグを書いておけば、あとで同じ点数を再現できます。
 
 ### Python（`starter/` を入れる）
 
