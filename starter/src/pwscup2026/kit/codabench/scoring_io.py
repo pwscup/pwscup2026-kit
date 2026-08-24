@@ -130,6 +130,33 @@ def _pool_set(csv_path: Path) -> set[int]:
     return set(pd.read_csv(csv_path)["pool_id"].astype(int).tolist())
 
 
+#: `mia_per_target` の帯の境目。**公開する値**（詳細結果の `constants.mia_band_edges` に出す）。
+MIA_BAND_EDGES = (0.25, 0.5, 0.75)
+
+
+def _mia_band(tpr_at_low_fpr: float) -> int:
+    """MIA の TPR@low-FPR を 1〜4 の帯に落とす。**上側を含む**（帯2 = (0.25, 0.5]）。
+
+    ★判定に使うのは `tpr_at_low_fpr`（**全体チャネル**の値）だけ。得点の `score`（= max）に
+    **変えてはならない**。根拠は事務局の設計文書
+    `docs/task_attack_detail_granularity_仕様.md` §2（配布物・採点イメージには含まれない）。
+    実際の歯止めは `test_attack_detail_mia_band_uses_all_channel_not_score`
+    （テストは採点イメージにも公開キットにも入らない）。
+
+    NaN 分岐は置かない: `attack_score._tpr_at_fpr` は退化入力でも 0.0 を返し、
+    それ以外は有限値の線形補間なので `tpr_at_low_fpr` は NaN にならない。
+    """
+    v = float(tpr_at_low_fpr)
+    lo, mid, hi = MIA_BAND_EDGES
+    if v <= lo:
+        return 1
+    if v <= mid:
+        return 2
+    if v <= hi:
+        return 3
+    return 4
+
+
 def _membership_truth(candidate_pool_ids: np.ndarray, target_pool_set: set[int]) -> np.ndarray:
     """候補行の pool_id が ターゲット pool 集合に入るか（overlap 真値）。"""
     return np.isin(candidate_pool_ids, list(target_pool_set)).astype(int)
@@ -226,32 +253,49 @@ def score_mia_power(f_mia: pd.DataFrame, ref_dir: Path, cfg: dict, team_id: int 
     rare_mask = ap.loc[rid, "is_rare"].to_numpy(dtype=bool) if "is_rare" in ap else None
 
     target_cols = [c for c in f_mia.columns if c != "record_id"]
-    per_target: dict[str, float] = {}
+    # ★2026-08-13: 標的別は**実数をやめて 1〜4 の帯**にする。標的別に細かい数値を返すと、
+    #   匿名化データを使わずに採点結果だけから答えを絞り込めてしまうため
+    #   （詳しくは docs/task_attack_detail_granularity_仕様.md §1）。
+    #   集約に必要な成分は別に持ち回る。
+    per_score: list[float] = []
     per_all: list[float] = []
     per_rare: list[float] = []
+    per_auc: list[float] = []
+    per_band: dict[str, int] = {}
     for col in target_cols:
         k = int(col)
         target_set = _pool_set(ref_dir / f"pool_ids_{k}.csv")
         truth = _membership_truth(cand_pool_ids, target_set)
         conf = pd.to_numeric(f_mia[col], errors="coerce").to_numpy(dtype=float)
         res = attack_score.score_mia(conf, truth, cfg, rare_mask=rare_mask)
-        per_target[str(k)] = float(res.score)
-        per_all.append(float(res.breakdown.get("tpr_at_low_fpr", float("nan"))))
+        tpr_all = float(res.breakdown.get("tpr_at_low_fpr", float("nan")))
+        per_score.append(float(res.score))
+        per_all.append(tpr_all)
         per_rare.append(float(res.breakdown.get("tpr_rare", float("nan"))))
+        per_auc.append(float(res.breakdown.get("auc", float("nan"))))
+        # ★帯は **tpr_all（全体チャネル）** で決める。res.score（= max）ではない。
+        #   変更しないこと。根拠は `_mia_band` の docstring が指す設計文書を参照。
+        per_band[str(k)] = _mia_band(tpr_all)
 
-    power = float(np.mean(list(per_target.values()))) if per_target else 0.0
+    power = float(np.mean(per_score)) if per_score else 0.0
     # ★全体/希少の内訳をLB列に出す。ターゲット平均。
     #   希少側は標的によっては陽性0でNaNになるので nanmean（全NaNなら0）。
-    return {"power": power, "per_target": per_target,
-            "all": _nanmean(per_all), "rare": _nanmean(per_rare)}
+    return {"power": power,
+            "all": _nanmean(per_all), "rare": _nanmean(per_rare),
+            "auc": _nanmean(per_auc), "per_target_band": per_band}
 
 
 def score_aia_power(f_aia: pd.DataFrame, ref_dir: Path, cfg: dict) -> dict:
     """AIAロングを採点する。ターゲット k ごとに aia_truth_k で member/control に割り、
     score_aia を取り、ターゲット平均を power とする。"""
+    # AIA の標的別は従来どおり score の実数を返す（帯にするのは MIA だけ）。
     per_target: dict[str, float] = {}
     per_all: list[float] = []
     per_rare: list[float] = []
+    per_p_m: list[float] = []
+    per_p_c: list[float] = []
+    per_p_m_rare: list[float] = []
+    per_p_c_rare: list[float] = []
     for k, grp in f_aia.groupby(f_aia["target_k"].astype(int)):
         truth = pd.read_csv(ref_dir / f"aia_truth_{int(k)}.csv")  # challenge_row_id,label,onset,time,is_rare
         merged = grp.merge(truth, on="challenge_row_id", how="inner", suffixes=("", "_truth"))
@@ -273,10 +317,17 @@ def score_aia_power(f_aia: pd.DataFrame, ref_dir: Path, cfg: dict) -> dict:
         per_target[str(int(k))] = float(res.score)
         per_all.append(float(res.breakdown.get("r_time_all", float("nan"))))
         per_rare.append(float(res.breakdown.get("r_time_rare", float("nan"))))
+        per_p_m.append(float(res.breakdown.get("succ_time_member", float("nan"))))
+        per_p_c.append(float(res.breakdown.get("succ_time_control", float("nan"))))
+        per_p_m_rare.append(float(res.breakdown.get("succ_time_member_rare", float("nan"))))
+        per_p_c_rare.append(float(res.breakdown.get("succ_time_control_rare", float("nan"))))
 
     power = float(np.nanmean(list(per_target.values()))) if per_target else 0.0
     return {"power": power, "per_target": per_target,
-            "all": _nanmean(per_all), "rare": _nanmean(per_rare)}
+            "all": _nanmean(per_all), "rare": _nanmean(per_rare),
+            # 教材が「詳細結果に表示されます」と書いている p_m/p_c（標的平均）。
+            "p_m": _nanmean(per_p_m), "p_c": _nanmean(per_p_c),
+            "p_m_rare": _nanmean(per_p_m_rare), "p_c_rare": _nanmean(per_p_c_rare)}
 
 
 def score_attack(frames: dict[str, pd.DataFrame], ref_dir: Path, cfg: dict,
@@ -298,5 +349,37 @@ def score_attack(frames: dict[str, pd.DataFrame], ref_dir: Path, cfg: dict,
         "attack_power": _finite(mia["power"]) + _finite(aia["power"]),
         "mia_all": mia["all"], "mia_rare": mia["rare"],
         "aia_all": aia["all"], "aia_rare": aia["rare"],
-        "_breakdown": {"mia_per_target": mia["per_target"], "aia_per_target": aia["per_target"]},
+        # ★2026-08-13: 詳細結果の内訳は成分別の集約＋標的別。MIA の標的別は**実数でなく帯**。
+        #   標的別に細かい数値を返すと、匿名化データを使わずに採点結果だけから答えを
+        #   絞り込めてしまうため（docs/task_attack_detail_granularity_仕様.md §1）。
+        #   帯に粗くすれば、自分の攻撃がどの標的に効いたかは分かるまま、その読み取りには
+        #   使えなくなる。得点そのものは一切変えていない（表示だけの変更）。
+        "_breakdown": {
+            "mia": {
+                "tpr_at_low_fpr": mia["all"],   # LB内訳1（MIA全体）と同じ値
+                "tpr_rare": mia["rare"],        # LB内訳2（MIA希少）と同じ値
+                "auc": mia["auc"],              # 標的ごとの AUC の平均（採点には使わない診断値）
+            },
+            # 標的ごとの 1〜4 の帯。**全体チャネル tpr_at_low_fpr で判定**（score ではない）。
+            "mia_per_target": mia["per_target_band"],
+            "aia": {
+                "r_time_all": aia["all"],       # LB内訳3（AIA全体）と同じ値
+                "r_time_rare": aia["rare"],     # LB内訳4（AIA希少・z·SE デッドゾーン後）と同じ値
+                # 成功率そのもの（標的平均）。R は (p_m − p_c) を (1 − p_c) で正規化した値なので、
+                # この2つを見れば「当たったが対照も当たっていた」のか「本当に会員だけ当てた」のか判る。
+                # ★注意: これは**標的ごとの成功率の平均**で、r_time_* は**標的ごとの R の平均**。
+                #   比の平均 ≠ 平均の比 なので (p_m − p_c)/(1 − p_c) は r_time_all に厳密一致しない
+                #   （目安として読む値。標的1つぶんの内訳を出すと標的別に戻ってしまうため出さない）。
+                "p_m": aia["p_m"], "p_c": aia["p_c"],
+                "p_m_rare": aia["p_m_rare"], "p_c_rare": aia["p_c_rare"],
+            },
+            # AIA の標的別は従来どおり score の実数。
+            "aia_per_target": aia["per_target"],
+            "constants": {
+                "low_fpr": float(cfg["scoring"]["low_fpr"]),
+                "tau_time": float(cfg["aia"]["tau_time"]),
+                "aia_rare_se_z": float(cfg["scoring"].get("aia_rare_se_z", 0.0)),
+                "mia_band_edges": list(MIA_BAND_EDGES),
+            },
+        },
     }

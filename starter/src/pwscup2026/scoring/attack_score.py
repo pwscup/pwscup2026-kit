@@ -159,10 +159,16 @@ def score_aia(
     r_time = r_time_all
     r_time_rare = float("nan")
     r_time_rare_raw = float("nan")
+    succ_m_rare = float("nan")
+    succ_c_rare = float("nan")
     if member_rare_mask is not None and control_rare_mask is not None:
         mm = np.asarray(member_rare_mask, dtype=bool)
         cm = np.asarray(control_rare_mask, dtype=bool)
         if mm.any() and cm.any():
+            # 希少側の生の成功率（p_m/p_c）。R_from_rate_deadzone が内部で使う値と同じで、
+            # 詳細結果に「どれだけ当てて、対照はどれだけ当たってしまったか」を出すために取り出す。
+            succ_m_rare = float(np.mean(succ_m[mm]))
+            succ_c_rare = float(np.mean(succ_c[cm]))
             r_time_rare_raw = R_from_rate(succ_m[mm].astype(float), succ_c[cm].astype(float))
             r_time_rare = R_from_rate_deadzone(
                 succ_m[mm].astype(float), succ_c[cm].astype(float), rare_z
@@ -188,6 +194,8 @@ def score_aia(
         "tpr_onset_control": tpr_c,
         "succ_time_member": float(np.mean(succ_m)) if len(succ_m) else float("nan"),
         "succ_time_control": float(np.mean(succ_c)) if len(succ_c) else float("nan"),
+        "succ_time_member_rare": succ_m_rare,    # 希少会員の成功率（希少マスク未指定/空ならnan）
+        "succ_time_control_rare": succ_c_rare,   # 希少対照の成功率（同上）
         "tau_time": tau,
         "low_fpr": low_fpr,
     }
