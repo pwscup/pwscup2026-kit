@@ -15,6 +15,22 @@ from . import schema
 
 _DAYS_PER_YEAR = 365.25
 
+
+def read_scoring_csv(source, **kwargs) -> pd.DataFrame:
+    """採点・検証が読む CSV は必ずこれを通す。
+
+    **これが無いと何が言えなくなるか。** pandas の既定の CSV リーダーは速い近似変換で
+    10進表記を double にする。その丸め誤差はビルドに依存するので、**同じファイル・同じ
+    pandas でも環境によって別の double になる**ことがある。値の完全一致を数える指標
+    （`scoring.utility._no_dup`）では、この差がそのまま得点差になる。
+
+    `float_precision="round_trip"` は書かれた10進表記を**最も近い double へ正しく丸める**ので、
+    どの環境でも同じ値になる。書式には依存しない（`41` と `41.0` は同じ double）ので、
+    書式を変えて重複判定をすり抜ける手も塞がる（生テキストの比較にはこの性質が無い）。
+    """
+    kwargs.setdefault("float_precision", "round_trip")
+    return pd.read_csv(source, **kwargs)
+
 #: 配布形式（1人1行・record_id一意）の列。
 #: QI = age/sex/prefecture。
 DISTRIBUTED_COLUMNS = [

@@ -31,6 +31,10 @@ from .result import ReportLevel, UtilityResult
 _COX_COLUMNS = ["age", "sex", "BMI", "SBP", "log_TG", "HDL", "log_ALT", "FPG", "smoking"]
 _CATEGORICAL = ["sex", "smoking", "prefecture"]
 _PMSE_FEATURES = list(schema.CONTINUOUS) + ["sex", "smoking"]
+_CORR_FEATURES = ["age", "sex", "BMI", "SBP", "TG", "HDL", "ALT", "FPG", "smoking"]
+# novel（U_valid の4本目）で使う12列。prefecture は除く＝私的コアのせいで A_bg と B の県分布が
+# 違い、床が作れないため（2026-08-25 の C2ST と同じ理由）。
+_NOVEL_FEATURES = list(schema.CONTINUOUS) + ["time", "sex", "smoking", "onset", "death"]
 
 
 @dataclass
@@ -46,6 +50,8 @@ class UtilityReference:
         None なら `_score_u_time` が b から計算する。
     km_floor: 発症曲線L1の標本雑音床（B独立2ブートストラップのL1積分の分位）。この値までは
         KMサンプリング雑音として無罰（デッドゾーン）。Noneなら床=0（デッドゾーン無し）。
+    a_bg: 全チーム共通の背景データ（配布形式）。U_valid の `novel` だけが使う。
+        参加者も同じファイルを持っているので手元で同じ値を再現できる。None なら novel は無効。
     """
 
     mu: np.ndarray
@@ -54,6 +60,7 @@ class UtilityReference:
     b_is_rare: np.ndarray | None = None
     km_signal_D: float | None = None
     km_floor: float | None = None
+    a_bg: pd.DataFrame | None = None
 
 
 def _prepare(df: pd.DataFrame) -> pd.DataFrame:
@@ -117,18 +124,288 @@ def _pmse(c_static: pd.DataFrame, b_static: pd.DataFrame) -> tuple[float, float,
     return pmse, ceiling, score
 
 
-def _score_u_gen(
-    c_static: pd.DataFrame, b_static: pd.DataFrame, time_dz: float, time_detail: dict
-) -> tuple[float, dict]:
-    """一般有用性＝min(marginal_mean, pmse_score, time_dz) の弱点支配集約。
+def _spearman_corr_matrix(df: pd.DataFrame, features: list[str]) -> np.ndarray:
+    """指定列のSpearman相関行列を返す。"""
+    missing = [col for col in features if col not in df.columns]
+    if missing:
+        raise ValueError(f"相関評価に必要な列がありません: {missing}")
 
-    3指標は直交する相補的な故障検出器（周辺分布 / joint忠実度pMSE / 発症曲線）ゆえ min で集約。
-    marginal_mean=10列(連続7=1−KS / カテゴリ3=1−TVD)の平均。旧式は marginal_mean と marginal_worst を
-    共に平均へ入れ周辺を二重計上していたが、min では marginal_mean のみ採用（marginal は worst でなく
-    mean＝k-anon を DP 並みに過剰減点しないため）。marginal_worst はスコアから外し診断 detail にのみ残す
-    （ダッシュボード/オフライン集計は BREAKDOWN で各サブ指標を取り出せる）。time_dz は旧 U_time（発症フリー
-    KM曲線L1のデッドゾーン正規化）を統合した安全網＝通常
-    1.0、発症構造破壊時のみ沈む。
+    x = df[features].copy()
+    for col in features:
+        x[col] = pd.to_numeric(x[col], errors="coerce")
+
+    return x.corr(method="spearman").to_numpy(dtype=float)
+
+
+def _corr_pair_diffs(corr_c: np.ndarray, corr_b: np.ndarray) -> tuple[np.ndarray, dict]:
+    """2つの相関行列について、上三角部分の絶対差を返す。
+
+    処理規則:
+    - 両方とも有限値: 通常の絶対差を使用する。
+    - 両方とも非有限値: 両データで相関が定義できないため、評価対象外とする。
+    - 片方だけ非有限値: 相関構造が片側でのみ消失しているため、差を1.0とする。
+    """
+    if corr_c.shape != corr_b.shape:
+        raise ValueError(f"比較する相関行列の形状が一致していません: {corr_c.shape} != {corr_b.shape}")
+    if corr_c.ndim != 2 or corr_c.shape[0] != corr_c.shape[1]:
+        raise ValueError("corr_cは正方行列である必要があります")
+    if corr_b.ndim != 2 or corr_b.shape[0] != corr_b.shape[1]:
+        raise ValueError("corr_bは正方行列である必要があります")
+
+    upper = np.triu_indices(corr_c.shape[0], k=1)
+    vals_c = corr_c[upper]
+    vals_b = corr_b[upper]
+
+    finite_c = np.isfinite(vals_c)
+    finite_b = np.isfinite(vals_b)
+    both_finite = finite_c & finite_b
+    both_invalid = ~finite_c & ~finite_b
+    one_invalid = finite_c ^ finite_b
+
+    diffs = np.empty(vals_c.shape, dtype=float)
+    diffs[both_finite] = np.abs(vals_c[both_finite] - vals_b[both_finite])
+    diffs[one_invalid] = 1.0
+    diffs = diffs[~both_invalid]
+
+    detail = {
+        "n_pairs_total": int(len(vals_c)),
+        "n_pairs_used": int(len(diffs)),
+        "n_pairs_both_finite": int(both_finite.sum()),
+        "n_pairs_one_invalid": int(one_invalid.sum()),
+        "n_pairs_excluded": int(both_invalid.sum()),
+    }
+    return diffs, detail
+
+
+def _corr_distance(
+    c_static: pd.DataFrame, b_static: pd.DataFrame, features: list[str], tail_quantile: float
+) -> tuple[float, float, dict]:
+    """C/BのSpearman相関行列差を計算する。
+
+    戻り値:
+        mean_dist: 全列ペアの相関差の平均。
+        tail_dist: 相関差の上位分位点。一部の大きな相関崩壊が平均で希釈されるのを防ぐ。
+        detail: 計算対象ペア数などの詳細。
+    """
+    if not 0.0 <= tail_quantile <= 1.0:
+        raise ValueError(f"tail_quantileは0以上1以下である必要があります: {tail_quantile}")
+
+    corr_c = _spearman_corr_matrix(c_static, features)
+    corr_b = _spearman_corr_matrix(b_static, features)
+    diffs, pair_detail = _corr_pair_diffs(corr_c, corr_b)
+
+    if len(diffs) == 0:
+        # すべてのペアがC/B両方で定義不能の場合、相関に関する情報がないため中立的に距離0とする。
+        # 定数化や周辺分布の不一致はmarginal側で評価される。
+        mean_dist = 0.0
+        tail_dist = 0.0
+    else:
+        mean_dist = float(np.mean(diffs))
+        tail_dist = float(np.quantile(diffs, tail_quantile))
+
+    detail = {
+        **pair_detail,
+        "mean_dist": mean_dist,
+        "tail_dist": tail_dist,
+        "tail_quantile": float(tail_quantile),
+    }
+    return mean_dist, tail_dist, detail
+
+
+def _score_u_corr(c_static: pd.DataFrame, b_static: pd.DataFrame, cfg: dict) -> tuple[float, dict]:
+    """一般集団における列間依存構造（順位相関）の忠実度（案K・2026-08-21導入・2026-09-08目盛り確定）。
+
+    対象は `_CORR_FEATURES`。C/B の Spearman 相関行列の上三角差を平均と上位分位点の
+    両方で見て、小さい方を採用する（平均的な再現性と、一部だけ大きく崩れた列ペアの両方を要求）。
+
+    ★`mean_scale`/`tail_scale` は config 上書きに頼らずここの既定値を確定値にする
+    （採点イメージと自己採点キットで別々の値になる事故を避ける）。
+    """
+    corr_cfg = cfg.get("scoring", {}).get("u_gen", {}).get("correlation", {})
+    enabled = bool(corr_cfg.get("enabled", True))
+    if not enabled:
+        return 1.0, {"enabled": False, "score": 1.0}
+
+    features = corr_cfg.get("features") or list(_CORR_FEATURES)
+    tail_quantile = float(corr_cfg.get("tail_quantile", 0.90))
+    mean_scale = float(corr_cfg.get("mean_scale", 0.40))
+    tail_scale = float(corr_cfg.get("tail_scale", 0.80))
+    if mean_scale <= 0.0:
+        raise ValueError(f"correlation.mean_scaleは正である必要があります: {mean_scale}")
+    if tail_scale <= 0.0:
+        raise ValueError(f"correlation.tail_scaleは正である必要があります: {tail_scale}")
+
+    observed_mean, observed_tail, dist_detail = _corr_distance(
+        c_static, b_static, features=features, tail_quantile=tail_quantile
+    )
+    mean_score = float(np.clip(1.0 - observed_mean / mean_scale, 0.0, 1.0))
+    tail_score = float(np.clip(1.0 - observed_tail / tail_scale, 0.0, 1.0))
+    corr_score = float(min(mean_score, tail_score))  # 平均的な相関再現性と局所崩壊の両方を要求
+
+    detail = {
+        "enabled": True,
+        "score": corr_score,
+        "features": list(features),
+        "method": "spearman",
+        "observed_mean_dist": float(observed_mean),
+        "observed_tail_dist": float(observed_tail),
+        "mean_score": mean_score,
+        "tail_score": tail_score,
+        "mean_scale": mean_scale,
+        "tail_scale": tail_scale,
+        "tail_quantile": tail_quantile,
+        **dist_detail,
+    }
+    return corr_score, detail
+
+
+# --------------------------------------------------------------------------- #
+# U_tail: 裾（外れ度の分布）の忠実度。候補2（2026-08-25 設計・2026-09-02 移植）。
+#   採点の marginal は列ごとの KS で、裾は多変量の性質なのでほぼ見えない。U_rare が見ているのは
+#   外れ「率」(mass_star) だけで、gate=band.lo を超えた先の形も手前の裾の厚みも見ていない。
+#   「周辺分布と相関は保ったまま同時分布の外れ値だけ消す」加工に価格を付けるための軸。
+#   床は A_bg の互いに素な標本の対から作った固定表（configs で配る）。A_bg は全チーム同一なので
+#   採点側に乱数が入らず、参加者も手元で同じ値を再現できる。
+#   ★コード側の既定は `enabled=False`（config を渡さない旧来の呼び出しを壊さないため）。
+#   配られる `kit_config.yaml` では `enabled: true` を明示し、U_gen の min-5 に常時入る。
+# --------------------------------------------------------------------------- #
+
+_TAIL_LAB = ["BMI", "SBP", "TG", "HDL", "ALT", "FPG"]
+_TAIL_UP_Q = (95.0, 99.0, 99.9)
+_TAIL_DN_Q = (5.0, 1.0, 0.1)
+
+
+def _q(q: float) -> str:
+    return str(int(q)) if float(q).is_integer() else str(q)
+
+
+def _tail_stat_names() -> tuple[list[str], list[str]]:
+    up = [f"{c}_q{_q(q)}" for c in _TAIL_LAB for q in _TAIL_UP_Q] + [f"maha_q{_q(q)}" for q in _TAIL_UP_Q]
+    dn = [f"{c}_q{_q(q)}" for c in _TAIL_LAB for q in _TAIL_DN_Q]
+    return up, dn
+
+
+def _tail_vector(df: pd.DataFrame, ref: "UtilityReference") -> dict[str, float]:
+    """裾の統計量。検査値6列の6分位点＋マハラノビス距離の3分位点。参照は ref.mu/ref.sigma のみ。"""
+    out: dict[str, float] = {}
+    for col in _TAIL_LAB:
+        v = df[col].to_numpy(dtype=float)
+        for q in (0.1, 1.0, 5.0, 95.0, 99.0, 99.9):
+            out[f"{col}_q{_q(q)}"] = float(np.percentile(v, q))
+    d = outlier_mod.mahalanobis(df, ref.mu, ref.sigma, schema.CONTINUOUS)
+    for q in _TAIL_UP_Q:
+        out[f"maha_q{_q(q)}"] = float(np.percentile(d, q))
+    return out
+
+
+def _score_u_tail(
+    c_static: pd.DataFrame, b_static: pd.DataFrame, ref: "UtilityReference", cfg: dict
+) -> tuple[float | None, dict]:
+    """裾の忠実度 U_tail = min(U_shift, U_spike)。
+
+    U_shift（系統的なずれ）＝上側統計量と下側統計量それぞれの平均 z を、帰無での散らばりで
+        正規化して合成した shiftz を、Z1 のデッドゾーン付きで K1 の傾きで写す。
+    U_spike（局所的な破れ）＝統計量ごとに |ΔS| を max(3σ_床, 0.05×B の IQR) で割り、1 を超えた
+        分だけを 10 で頭打ちにして平均し、K2 の傾きで写す。0.05×IQR の歯止めは σ が偶然小さい
+        統計量で罰さないため。
+    床 σ と較正比は configs の固定表（A_bg 由来・全チーム共通）。採点側に乱数は入らない。
+    """
+    tail_cfg = (cfg.get("scoring", {}).get("u_gen", {}) or {}).get("tail", {}) or {}
+    if not bool(tail_cfg.get("enabled", False)):
+        return None, {"enabled": False}
+    floor_sd = tail_cfg.get("floor_sd") or {}
+    ratio = tail_cfg.get("ratio") or {}
+    if not floor_sd:
+        raise ValueError("scoring.u_gen.tail.floor_sd が空です（床の固定表が要ります）")
+    z1 = float(tail_cfg.get("shift_deadzone_z", 3.0))
+    k1 = float(tail_cfg.get("shift_scale", 5.0))
+    k2 = float(tail_cfg.get("spike_scale", 0.5))
+    cap = float(tail_cfg.get("spike_cap", 10.0))
+    iqr_guard = float(tail_cfg.get("iqr_guard", 0.05))
+    ratio_max = float(tail_cfg.get("ratio_max", 1.4))
+    norm_up = float(tail_cfg.get("shift_norm_up", 0.303))
+    norm_dn = float(tail_cfg.get("shift_norm_dn", 0.293))
+
+    up, dn = _tail_stat_names()
+    use = [s for s in up + dn if float(ratio.get(s, 9.0)) <= ratio_max]
+    t_c = _tail_vector(c_static, ref)
+    t_b = _tail_vector(b_static, ref)
+
+    iqr = {col: float(np.percentile(b_static[col], 75) - np.percentile(b_static[col], 25)) for col in _TAIL_LAB}
+    md_b = outlier_mod.mahalanobis(b_static, ref.mu, ref.sigma, schema.CONTINUOUS)
+    iqr["maha"] = float(np.percentile(md_b, 75) - np.percentile(md_b, 25))
+
+    zs: dict[str, float] = {}
+    excess: list[float] = []
+    for s in use:
+        sig = float(floor_sd[s]) * max(float(ratio.get(s, 1.0)), 1.0)
+        delta = t_c[s] - t_b[s]
+        zs[s] = delta / sig if sig > 0 else float("nan")
+        den = max(3.0 * sig, iqr_guard * iqr[s.split("_q")[0]])
+        excess.append(min(max(0.0, abs(delta) / den - 1.0), cap) if den > 0 else 0.0)
+
+    up_used = [s for s in use if s in up]
+    dn_used = [s for s in use if s in dn]
+    mean_z_up = float(np.nanmean([zs[s] for s in up_used])) if up_used else 0.0
+    mean_z_dn = float(np.nanmean([zs[s] for s in dn_used])) if dn_used else 0.0
+    shiftz = float(np.sqrt((mean_z_up / norm_up) ** 2 + (mean_z_dn / norm_dn) ** 2) / np.sqrt(2.0))
+    spike = float(np.mean(excess)) if excess else 0.0
+
+    u_shift = float(np.clip(1.0 - max(0.0, shiftz - z1) / k1, 0.0, 1.0))
+    u_spike = float(np.clip(1.0 - spike / k2, 0.0, 1.0))
+    score = float(min(u_shift, u_spike))
+    detail = {
+        "enabled": True,
+        "u_shift": u_shift,
+        "u_spike": u_spike,
+        "shiftz": shiftz,
+        "spike": spike,
+        "mean_z_up": mean_z_up,
+        "mean_z_dn": mean_z_dn,
+        "n_stat": len(use),
+    }
+    return score, detail
+
+
+def build_tail_floor(
+    a_bg: pd.DataFrame, ref: "UtilityReference", n: int, *, reps: int = 300, seed: int = 20260825
+) -> dict[str, float]:
+    """裾の床（統計量ごとの sd）を A_bg から作る。configs へ焼く固定表の生成器。
+
+    A_bg の**互いに素な** n 行標本を2本引き、統計量の差を reps 回集めて sd を取る。
+    A_bg は全チーム同一ファイルなので、この表はコホートに依らず1本で足りる。
+    採点時はこの関数を呼ばず configs の表を読む（採点側に乱数を入れないため）。
+    """
+    if 2 * n > len(a_bg):
+        raise ValueError(f"A_bg の行数 {len(a_bg)} では互いに素な {n} 行標本を2本取れません")
+    rng = np.random.default_rng(seed)
+    up, dn = _tail_stat_names()
+    keys = up + dn
+    diffs = np.full((reps, len(keys)), np.nan)
+    for r in range(reps):
+        idx = rng.permutation(len(a_bg))
+        s1 = _tail_vector(a_bg.iloc[idx[:n]].reset_index(drop=True), ref)
+        s2 = _tail_vector(a_bg.iloc[idx[n : 2 * n]].reset_index(drop=True), ref)
+        diffs[r] = [s1[k] - s2[k] for k in keys]
+    return {k: float(v) for k, v in zip(keys, np.nanstd(diffs, axis=0, ddof=1))}
+
+
+def _score_u_gen(
+    c_static: pd.DataFrame,
+    b_static: pd.DataFrame,
+    time_dz: float,
+    time_detail: dict,
+    ref: "UtilityReference",
+    cfg: dict,
+) -> tuple[float, dict]:
+    """一般有用性＝min(marginal_mean, corr_score, pmse_score, time_dz, tail_score) の弱点支配集約。
+
+    5指標は役割の異なる相補的な故障検出器（周辺分布 / 順位相関構造 / joint忠実度pMSE / 発症曲線 / 裾）
+    ゆえ min で集約。marginal_mean=10列(連続7=1−KS / カテゴリ3=1−TVD)の平均。旧式は marginal_mean と
+    marginal_worst を共に平均へ入れ周辺を二重計上していたが、min では marginal_mean のみ採用（marginal は
+    worst でなく mean＝k-anon を DP 並みに過剰減点しないため）。marginal_worst はスコアから外し診断 detail
+    にのみ残す（ダッシュボード/オフライン集計は BREAKDOWN で各サブ指標を取り出せる）。time_dz は旧 U_time
+    （発症フリーKM曲線L1のデッドゾーン正規化）を統合した安全網＝通常1.0、発症構造破壊時のみ沈む。
     """
     marginal: dict[str, float] = {}
     for col in schema.CONTINUOUS:
@@ -140,17 +417,26 @@ def _score_u_gen(
     marginal_mean = float(np.mean(list(marginal.values())))
     marginal_worst = float(np.min(list(marginal.values())))
     pmse, ceiling, pmse_score = _pmse(c_static, b_static)
+    corr_score, corr_detail = _score_u_corr(c_static, b_static, cfg)
 
-    facet = float(min(marginal_mean, pmse_score, time_dz))  # min-3（worstはmeanに畳まず診断のみ）
+    parts = [marginal_mean, corr_score, pmse_score, time_dz]
+    tail_score, tail_detail = _score_u_tail(c_static, b_static, ref, cfg)
+    if tail_score is not None:
+        parts.append(tail_score)  # kit_config.yaml の enabled=true で min-5 に入る
+    facet = float(min(parts))  # worstはmeanに畳まず診断のみ
     detail = {
         "marginal": marginal,
         "marginal_mean": marginal_mean,
         "marginal_worst": marginal_worst,
+        "corr_score": corr_score,
+        "correlation": corr_detail,
         "pmse": pmse,
         "pmse_ceiling": ceiling,
         "pmse_score": pmse_score,
         "time_dz": time_dz,
         "time": time_detail,
+        "tail_score": tail_score,
+        "tail": tail_detail,
     }
     return facet, detail
 
@@ -497,9 +783,7 @@ def _score_u_rare(
         """較正値を返す。ただし ★次のゲートがある:
         参照(B)側に検証可能な希少がある（真値 n_b_truth ≥ gate かつ B検出 n_b_det ≥ gate）のに、
         C側の検出希少が gate 未満なら **0点**（希少群を再現できていない＝抑制で検証を回避させない）。
-        参照側が不足（世界に希少が少ない）なら従来どおり除外(None)。それ以外は自己ベースライン較正。
-        旧実装は C側不足でも除外(None)だったため、検出希少を8未満に絞ると c2st が min から外れて
-        U_rare が水増しできた（dodge）。"""
+        参照側が不足（世界に希少が少ない）なら従来どおり除外(None)。それ以外は自己ベースライン較正。"""
         ref_testable = (n_b_truth >= gate) and (n_b_det >= gate)
         if ref_testable and n_c_rare < gate:
             gated_axes.append(axis)
@@ -635,31 +919,170 @@ def _no_fab(c: pd.DataFrame, b: pd.DataFrame, cfg: dict) -> tuple[float, dict]:
     return score, detail
 
 
-def _score_u_valid(c: pd.DataFrame, b: pd.DataFrame, cfg: dict) -> tuple[float, dict]:
-    """内部妥当性 = mean{cens, no_fab}。
+def _no_dup(c: pd.DataFrame, cfg: dict) -> tuple[float, dict]:
+    """完全重複行のペナルティ（2026-08-20 追加）。同一個体を多重計上したデータは、行数ぶんの
+    独立標本があるという前提を壊す（分散の過小推定・実効n の水増し）＝内部妥当性の問題なので
+    U_valid に置く。**実データ B の重複行は全チームで 0 行**（連続7列を持つ13列の完全一致は
+    現実には起こらない）＝ tol=0 は「本物には無いものを作った」ことへの罰として素直。
 
-    - cens（打ち切り妥当率）: 非発症∧非死亡→time=horizon の一致率。他facetが見逃す1時点横断の
-      論理的不変量（このスキーマ唯一の強い関係的論理不変量・満たすこと=正しいこと・D3）。
+    dup_rate = (n - ユニーク行数)/n。no_dup = 1 - clip((dup_rate - tol)/scale, 0, 1)。
+    U_valid は mean 集約なので、これが 0 になっても facet は 3/4 までしか落ちない＝抑止の
+    強さは「弱くてよい」（D4 の no_fab と同じ位置づけ）。マイクロ集約系（群中心の繰り返しで
+    重複が出る）を過剰に殺さないのはこの mean のおかげ。
+    """
+    ncfg = cfg["scoring"].get("u_valid", {}).get("no_dup", {})
+    tol = float(ncfg.get("tol", 0.0))
+    scale = float(ncfg.get("scale", 0.2))
+
+    cols = [col for col in c.columns if col != "record_id"]
+    n = len(c)
+    n_uniq = len(c[cols].drop_duplicates())
+    dup_rate = float((n - n_uniq) / n) if n else 0.0
+    pen = float(np.clip((dup_rate - tol) / scale, 0.0, 1.0)) if scale > 0 else float(dup_rate > tol)
+    return float(1.0 - pen), {
+        "dup_rate": dup_rate,
+        "n_dup_rows": int(n - n_uniq),
+        "tol": tol,
+        "scale": scale,
+    }
+
+
+def _nn_min_dist(X: np.ndarray, A: np.ndarray, block: int = 256) -> np.ndarray:
+    """X の各行から A の最近傍までのユークリッド距離。行数が大きいのでブロックで回す。"""
+    out = np.empty(len(X), dtype=float)
+    for i in range(0, len(X), block):
+        d2 = ((X[i : i + block, None, :] - A[None, :, :]) ** 2).sum(-1)
+        out[i : i + block] = np.sqrt(d2.min(1))
+    return out
+
+
+def _score_u_novel(
+    c: pd.DataFrame, b: pd.DataFrame, a_bg: pd.DataFrame | None, cfg: dict
+) -> tuple[float | None, dict]:
+    """novel（新規性）= C の A_bg への異常接近が「新しい行を運んでいない」証拠になっていないか、を
+    超過質量 D+ で罰する。
+
+    ねらいは旧来の距離版と同じ: 分析者は背景データ A_bg を持っている。C がその部分集合を
+    渡すだけなら、分析者の手元は増えない。B の行は A_bg と互いに素なので、正直な C は A_bg への
+    最近傍距離の分布が B と同じになる。A_bg の行を選び直した C はこの距離が系統的に小さくなる。
+
+    旧実装（distance floor 版）は「B から A_bg への最近傍距離の下位分位点」という**定数**で
+    打切っていた。打切りの位置を人が決めない器として、片側二標本 KS 統計量 D+ に
+    差し替えている。
+
+    手続き。
+      1. `_NOVEL_FEATURES`（prefecture を除く12列）を A_bg の平均・標準偏差で標準化する。
+      2. d_c = C の各行から A_bg への最近傍距離、d_b = B の各行から A_bg への最近傍距離
+         （どちらも `_nn_min_dist`）。
+      3. D+ = sup_t [F_C(t) − F_B(t)]（経験分布関数の片側二標本KS統計量。C 側の距離分布が
+         B より手前（小さい側）へはみ出した質量の最大値＝「A_bg に異常接近した」度合い）。
+      4. novel = 1 − clip((D+ − d0) / (1 − d0), 0, 1)。d0 はサンプリング雑音のデッドゾーン
+         （既定 `scoring.u_valid.novel.deadzone` = 0.0534＝n=m=1049 の片側KS 5%点）。
+
+    無効なとき（A_bg 不在、または特徴列が足りない）は None を返し、`_score_u_valid` の平均に
+    入らない。
+    """
+    ncfg = (cfg.get("scoring", {}) or {}).get("u_valid", {}).get("novel", {}) or {}
+    if a_bg is None:
+        return None, {"enabled": False, "reason": "A_bg が渡されていない"}
+
+    feats = list(ncfg.get("features") or _NOVEL_FEATURES)
+    missing = [f for f in feats if f not in a_bg.columns or f not in c.columns or f not in b.columns]
+    if missing:
+        return None, {"enabled": False, "reason": f"列が足りない: {missing}"}
+
+    A = a_bg[feats].to_numpy(dtype=float)
+    mu = A.mean(axis=0)
+    sd = A.std(axis=0)
+    sd = np.where(sd > 0.0, sd, 1.0)  # 定数列でゼロ割りしない
+    Az = (A - mu) / sd
+
+    d0 = float(ncfg.get("deadzone", 0.0534))
+    if not 0.0 <= d0 < 1.0:
+        raise ValueError(f"scoring.u_valid.novel.deadzone は 0 以上 1 未満: {d0}")
+
+    d_b = _nn_min_dist((b[feats].to_numpy(dtype=float) - mu) / sd, Az)
+    d_c = _nn_min_dist((c[feats].to_numpy(dtype=float) - mu) / sd, Az)
+
+    d_plus = float(ks_2samp(d_c, d_b, alternative="greater").statistic)
+    score = float(np.clip(1.0 - max(0.0, d_plus - d0) / (1.0 - d0), 0.0, 1.0))
+    detail = {
+        "enabled": True,
+        "novel": score,
+        "d_plus": d_plus,
+        "deadzone": d0,
+        "n_rows_C": len(d_c),
+        "n_rows_B": len(d_b),
+        "nn_dist_C_median": float(np.median(d_c)),
+        "nn_dist_B_median": float(np.median(d_b)),
+        "n_rows_A_bg": len(A),
+        "features": feats,
+    }
+    return score, detail
+
+
+def _score_u_valid(
+    c: pd.DataFrame, b: pd.DataFrame, ref: UtilityReference, cfg: dict
+) -> tuple[float, dict]:
+    """内部妥当性 = mean{cens, no_fab, no_dup, novel}。
+
+    - cens（打ち切り整合率）: 打ち切り構造が壊れていないか。**行単位の論理整合 と 母集団の
+      打ち切り率のB突き合わせ の両方**を課す（min＝弱いほう。2026-08-20 改修＝
+      belt-and-suspenders）。他facetが見逃す1時点横断の論理的不変量（満たすこと=正しいこと・D3）。
     - no_fab（関係捏造の片側罰）: 実データより強い群→指標の関係を作ったCを弱く罰す（D4）。
+    - no_dup（完全重複行の罰）: 同一個体の多重計上を弱く罰す。
+    - novel（新規性）: A_bg の部分集合を渡すだけの提出を D+ で罰す（§2.1・上の `_score_u_novel`）。
     旧 dir（FPG→発症の向き）/ nondm（非糖尿病FPG率）は U_spec / U_gen と実測collinearで冗長のため
     除外（D1/D2）。生理外の値はソフトでなく schema.ranges のハード棄却で弾く（D6）。集約=mean。
+
+    ★2026-08-20 改修（cens の退化分岐の穴を塞ぐ）: 旧実装は「自分が admin-censored と名乗った
+    行の中の time=horizon 一致率」だけを見ており、非発症行に death=1 を立てると admin-censored
+    が空になり rate_censor が無条件で 1.0（満点）になった。防御側は time 分布を壊して AIA
+    （標的=time）を無効化しつつ cens 満点を保てた。塞ぐために2つのチェックを AND（min）で課す:
+      (1) 行単位整合 cens_rowwise: admin-censored 行の time=horizon 一致率。**該当0人は満点でなく
+          0.0（異常）**にする（空にできる集合で満点を出さない）。
+      (2) 打ち切り率突き合わせ cens_rate_match: 母集団の time=horizon 率を B に合わせる
+          `1 − |p_hz(C) − p_hz(B)|`。**母集団の割合なので防御側が空にできない**＝(1) を
+          小さな compliant 部分集合だけ残して迂回する手も塞ぐ。
+    どちらも C=B・正当な加工（time を保つ加法ノイズ・k-匿名化・合成）では 1.0 のまま
+    （恒等アンカーでも |ΔU| = 0.00000）。
     """
     horizon = float(cfg["onset"]["horizon_years"])
+    atol = 1e-2
 
+    # (1) 行単位の論理整合。admin-censored（非発症∧非死亡）行の time が horizon か。
+    #     該当0人＝「防御側が空にできる集合」なので満点にせず 0.0（異常とみなす）。
     admin_censored = (c["onset"] == 0) & (c["death"] == 0)
     if admin_censored.any():
-        rate_censor = float(np.isclose(c.loc[admin_censored, "time"], horizon, atol=1e-2).mean())
+        cens_rowwise = float(np.isclose(c.loc[admin_censored, "time"], horizon, atol=atol).mean())
     else:
-        rate_censor = 1.0
+        cens_rowwise = 0.0
+    # (2) 母集団の打ち切り率（time=horizon の割合）を B に突き合わせる。割合なので空にできない。
+    p_hz_c = float(np.isclose(c["time"].to_numpy(dtype=float), horizon, atol=atol).mean())
+    p_hz_b = float(np.isclose(b["time"].to_numpy(dtype=float), horizon, atol=atol).mean())
+    cens_rate_match = 1.0 - min(abs(p_hz_c - p_hz_b), 1.0)
+    # belt-and-suspenders: 両方を満たすこと（弱いほうを採る）。2026-08-20 cens 穴の修正。
+    rate_censor = float(min(cens_rowwise, cens_rate_match))
 
     no_fab_score, no_fab_detail = _no_fab(c, b, cfg)
+    no_dup_score, no_dup_detail = _no_dup(c, cfg)
 
-    facet = float(np.mean([rate_censor, no_fab_score]))
+    parts = [rate_censor, no_fab_score, no_dup_score]
+    novel_score, novel_detail = _score_u_novel(c, b, getattr(ref, "a_bg", None), cfg)
+    if novel_score is not None:
+        parts.append(novel_score)  # A_bg が渡されているときのみ mean-4 に入る
+
+    facet = float(np.mean(parts))
     detail = {
         "censoring_realism_rate": rate_censor,
         "no_fab": no_fab_score,
         "no_fab_detail": no_fab_detail,
+        "no_dup": no_dup_score,
+        "no_dup_detail": no_dup_detail,
     }
+    if novel_score is not None:
+        detail["novel"] = novel_score
+        detail["novel_detail"] = novel_detail
     return facet, detail
 
 
@@ -690,10 +1113,10 @@ def score_utility(
     b = _prepare(B)
 
     time_dz, time_detail = _score_u_time(c, b, ref, cfg)
-    gen_score, gen_detail = _score_u_gen(c_static, b_static, time_dz, time_detail)
+    gen_score, gen_detail = _score_u_gen(c_static, b_static, time_dz, time_detail, ref, cfg)
     spec_score, spec_detail = _score_u_spec(c, b)
     rare_score, rare_detail = _score_u_rare(c, b, c_static, b_static, ref, cfg)
-    valid_score, valid_detail = _score_u_valid(c, b, cfg)
+    valid_score, valid_detail = _score_u_valid(c, b, ref, cfg)
 
     facets = {
         "U_gen": gen_score,
