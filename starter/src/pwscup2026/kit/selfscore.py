@@ -19,7 +19,7 @@
 CLI:
     python -m pwscup2026.kit.selfscore <C.csv または 提出zip> --dist <participant_data> [--json]
 Docker:
-    docker run --rm -v "$PWD":/w hajimeono/pwscup2026-kit:prelim-attack-20260825 score /w/C.csv --dist /w
+    docker run --rm -v "$PWD":/w hajimeono/pwscup2026-kit:main-process-20260912 score /w/C.csv --dist /w
 """
 from __future__ import annotations
 
@@ -34,6 +34,7 @@ import numpy as np
 import pandas as pd
 import yaml
 
+from ..common.submission_schema import read_scoring_csv
 from ..scoring.result import ReportLevel, json_safe
 from ..scoring.utility import UtilityReference, score_utility
 from . import validate as validate_mod
@@ -67,8 +68,8 @@ def load_submitted_c(path: str | Path) -> pd.DataFrame:
             names = [n for n in z.namelist() if n.rsplit("/", 1)[-1] == "C.csv"]
             if not names:
                 raise SelfScoreError(f"zipの中に C.csv がありません（自己採点は加工提出のみ）: {p}")
-            return pd.read_csv(io.BytesIO(z.read(names[0])), encoding="utf-8")
-    return pd.read_csv(p, encoding="utf-8")
+            return read_scoring_csv(io.BytesIO(z.read(names[0])), encoding="utf-8")
+    return read_scoring_csv(p, encoding="utf-8")
 
 
 def load_local_reference(dist_dir: str | Path) -> tuple[pd.DataFrame, UtilityReference, dict, dict]:
@@ -97,10 +98,10 @@ def load_local_reference(dist_dir: str | Path) -> tuple[pd.DataFrame, UtilityRef
     b_self = d / "B_self.csv"
     b_plain = d / "B_practice.csv"
     if b_self.exists():
-        b = pd.read_csv(b_self)
+        b = read_scoring_csv(b_self)
         has_b_self = "is_rare" in b.columns
     elif b_plain.exists():
-        b = pd.read_csv(b_plain)
+        b = read_scoring_csv(b_plain)
         has_b_self = False
     else:
         raise SelfScoreError(f"B_self.csv も B_practice.csv も見つかりません: {d}")
@@ -115,6 +116,11 @@ def load_local_reference(dist_dir: str | Path) -> tuple[pd.DataFrame, UtilityRef
     if b_is_rare is not None and len(b_is_rare) != len(b):
         raise SelfScoreError(f"is_rare({len(b_is_rare)}行) と B({len(b)}行) の行数が違います。")
 
+    # A_bg は U_valid の novel（超過質量D+）だけが使う。同じ配布フォルダにあるので追加配布は不要。
+    # 無くても採点は通る（novel が抜けて mean-3 になるだけ）。
+    a_bg_path = d / "A_bg.csv"
+    a_bg = read_scoring_csv(a_bg_path) if a_bg_path.exists() else None
+
     ref = UtilityReference(
         mu=np.asarray(ref_d["mu"], dtype=float),
         sigma=np.asarray(ref_d["sigma"], dtype=float),
@@ -122,8 +128,9 @@ def load_local_reference(dist_dir: str | Path) -> tuple[pd.DataFrame, UtilityRef
         b_is_rare=b_is_rare,
         km_signal_D=ref_d.get("km_signal_D"),
         km_floor=ref_d.get("km_floor"),
+        a_bg=a_bg,
     )
-    info = {"b_self": bool(b_is_rare is not None), "n_rows_B": int(len(b))}
+    info = {"b_self": bool(b_is_rare is not None), "n_rows_B": int(len(b)), "a_bg": bool(a_bg is not None)}
     return b, ref, cfg, info
 
 

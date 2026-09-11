@@ -1,7 +1,13 @@
 """採点ロジック（サーバ採点とローカル自己採点の単一ソース）。
 
-提出frames（検証済）＋reference_dataディレクトリ＋cfg から、リーダーボード用スコアを計算する。
+提出frames（検証済）＋**真値ディレクトリ（truth_dir）**＋cfg から、リーダーボード用スコアを計算する。
 **既存 scoring/ 純関数の薄ラッパ**で、新たな採点数理は足さない（単一ソース）。
+
+★引数名を `ref_dir` から `truth_dir` に
+改めた。本番では真値は reference_data ではなく worker ローカルの `/app/data` から読む。
+**関数のロジックは変えていない**＝渡されたディレクトリを読むだけ。呼び出し側（`run._run`）が
+truth_dir を決める（`/app/data` に `tokens.csv` があればそこ・無ければ従来どおり `$input/ref`。
+`PWSCUP_TRUTH_DIR` は明示の上書き）。
 
 - 加工（防御）: `utility`（score_utility）＋`protection`（1−参照攻撃器のMIA被攻撃度）。
 - 攻撃: `mia_power`（各ターゲット列の score_mia を集約）＋`aia_power`（各ターゲットの
@@ -20,12 +26,13 @@ import numpy as np
 import pandas as pd
 
 from ...attack import mia as mia_mod
+from ...common.submission_schema import read_scoring_csv
 from ...scoring import attack_score
 from ...scoring.result import ReportLevel
 from ...scoring.utility import UtilityReference, score_utility
 
-#: 本番参照データの目印。**このファイルが reference_data にあれば本番モード**＝提出の
-#: `token.txt` から team_id を引いて、その提出者向けの参照ファイルを選ぶ。無ければ練習モード
+#: 本番の目印。**このファイルが truth_dir にあれば本番モード**＝提出の
+#: `token.txt` から team_id を引いて、その参加者向けの参照ファイルを選ぶ。無ければ練習モード
 #: ＝従来どおりの固定ファイル名（`B_practice.csv` 等）を読む。
 #: 本番は 1フェーズ＝1タスク＝1つの reference_data に全参加チームぶんが入るので、
 #: **提出者を見分けないと全員が同じ1チームの B と比べられてしまう**。
@@ -35,21 +42,21 @@ TOKENS_FILE = "tokens.csv"
 # --------------------------------------------------------------------------- #
 # 提出者の解決（本番モード）
 # --------------------------------------------------------------------------- #
-def is_production_reference(ref_dir: str | Path) -> bool:
-    """reference_data が本番レイアウト（チーム別参照＋`tokens.csv`）か。"""
-    return (Path(ref_dir) / TOKENS_FILE).is_file()
+def is_production_reference(truth_dir: str | Path) -> bool:
+    """真値ディレクトリが本番レイアウト（チーム別参照＋`tokens.csv`）か。"""
+    return (Path(truth_dir) / TOKENS_FILE).is_file()
 
 
-def load_token_map(ref_dir: str | Path) -> dict[str, int]:
+def load_token_map(truth_dir: str | Path) -> dict[str, int]:
     """`tokens.csv`（列 `token,team_id`）を token→team_id で読む。無ければ空辞書。"""
-    p = Path(ref_dir) / TOKENS_FILE
+    p = Path(truth_dir) / TOKENS_FILE
     if not p.is_file():
         return {}
     df = pd.read_csv(p, dtype={"token": str})
     return {str(t).strip(): int(k) for t, k in zip(df["token"], df["team_id"])}
 
 
-def resolve_team_id(ref_dir: str | Path, token: str | None) -> int | None:
+def resolve_team_id(truth_dir: str | Path, token: str | None) -> int | None:
     """提出の token から team_id を引く。練習モード・未知トークンは None。
 
     ★未知トークンで採点を続けない（別チームの B と比べる事故を防ぐ）。本番モードで None なら
@@ -58,36 +65,35 @@ def resolve_team_id(ref_dir: str | Path, token: str | None) -> int | None:
     """
     if token is None:
         return None
-    return load_token_map(ref_dir).get(str(token).strip())
+    return load_token_map(truth_dir).get(str(token).strip())
 
 
-def _process_ref_paths(ref_dir: Path, team_id: int | None) -> tuple[Path, Path, Path]:
+def _process_ref_paths(truth_dir: Path, team_id: int | None) -> tuple[Path, Path, Path]:
     """加工採点で**提出者ごとに変わる**3ファイル (B, utility_ref, pool_ids) のパス。
 
     練習は固定名、本番はチーム番号つき。`A_bg.csv` と参照攻撃者（`B_ref.csv` /
     `pool_ids_ref.csv`）は全チーム共通なので、ここでは扱わない。
     """
     if team_id is None:
-        return (ref_dir / "B_practice.csv", ref_dir / "utility_ref.json", ref_dir / "pool_ids_practice.csv")
-    return (ref_dir / f"B_{team_id}.csv", ref_dir / f"utility_ref_{team_id}.json",
-            ref_dir / f"pool_ids_{team_id}.csv")
+        return (truth_dir / "B_practice.csv", truth_dir / "utility_ref.json", truth_dir / "pool_ids_practice.csv")
+    return (truth_dir / f"B_{team_id}.csv", truth_dir / f"utility_ref_{team_id}.json",
+            truth_dir / f"pool_ids_{team_id}.csv")
 
 
 # --------------------------------------------------------------------------- #
 # reference_data ローダ
 # --------------------------------------------------------------------------- #
-def load_utility_reference(ref_dir: Path, team_id: int | None = None) -> UtilityReference:
-    """reference_data の `utility_ref[_k].json` から `UtilityReference` を復元する。
+def load_utility_reference(truth_dir: Path, team_id: int | None = None) -> UtilityReference:
+    """truth_dir の `utility_ref[_k].json` から `UtilityReference` を復元する。
 
     mu/sigma/b_is_rare は配列化、band/scalar はそのまま。事務局が B から計算した値を
     移送しただけで、採点時に再計算はしない。
 
-    ★サーバ側の JSON は `b_is_rare`（真の希少ラベル）を入れて配る。参加者に配る
-    `utility_ref.json` は同じ場所が null で、参加者は同じ値を `B_self.csv` の `is_rare` 列から
-    供給する（真値の受け取り口を1つに絞ってある）。どちらの経路でも同じ値が入るので、
-    ローカル自己採点とサーバ採点は一致する（ルールブック §5.4）。
+    ★事務局側（truth_dir）の JSON は `b_is_rare` を**入れて**出す（`export.utility_reference_json(...,
+    include_b_is_rare=True)`）。参加者配布は null で、参加者は同じ値を `B_self.csv` の
+    `is_rare` 列から供給する＝真値の配布口を1つに絞る設計（ルールブック §5.4）。
     """
-    _, util_path, _ = _process_ref_paths(Path(ref_dir), team_id)
+    _, util_path, _ = _process_ref_paths(Path(truth_dir), team_id)
     d = json.loads(util_path.read_text(encoding="utf-8"))
     b_is_rare = d.get("b_is_rare")
     return UtilityReference(
@@ -165,7 +171,7 @@ def _membership_truth(candidate_pool_ids: np.ndarray, target_pool_set: set[int])
 # --------------------------------------------------------------------------- #
 # 加工（防御）採点
 # --------------------------------------------------------------------------- #
-def score_process(frames: dict[str, pd.DataFrame], ref_dir: Path, cfg: dict,
+def score_process(frames: dict[str, pd.DataFrame], truth_dir: Path, cfg: dict,
                   team_id: int | None = None) -> dict:
     """防御提出 `C.csv` を採点する（加工タスク）。
 
@@ -176,20 +182,22 @@ def score_process(frames: dict[str, pd.DataFrame], ref_dir: Path, cfg: dict,
     `team_id=None` は練習モード（固定ファイル名）。本番は `token.txt` から解決した team_id が
     渡され、提出者ごとに参照を選ぶ。
     """
-    ref_dir = Path(ref_dir)
+    truth_dir = Path(truth_dir)
     C = _canonicalize_c(frames["C.csv"])  # 提出順に依存しない正準順（再現性）
 
-    b_path, _, submitter_pool_path = _process_ref_paths(ref_dir, team_id)
-    b_submitter = pd.read_csv(b_path)
-    a_bg = pd.read_csv(ref_dir / "A_bg.csv")
-    util_ref = load_utility_reference(ref_dir, team_id)
+    b_path, _, submitter_pool_path = _process_ref_paths(truth_dir, team_id)
+    b_submitter = read_scoring_csv(b_path)
+    a_bg = read_scoring_csv(truth_dir / "A_bg.csv")
+    util_ref = load_utility_reference(truth_dir, team_id)
+    util_ref.a_bg = a_bg  # U_valid の novel（超過質量 D+）が使う。他のファセットは触らない。
 
     util = score_utility(C, b_submitter, util_ref, cfg, level=ReportLevel.BREAKDOWN)
 
-    # protection: 参照攻撃器 vs 参加者の C（本番匿名性の単体代理）
+    # protection: 参照攻撃器 vs 参加者の C（本番匿名性の単体代理・決定(b)）
     # ★参照攻撃者には、どのチームにも配っていない余りのコホートを充てる。
-    b_ref = pd.read_csv(ref_dir / "B_ref.csv")
-    ref_pool = pd.read_csv(ref_dir / "pool_ids_ref.csv")  # record_id, pool_id, is_rare（B_ref行順）
+    #   実参加チームを流用すると、そのチームの保護を自分のコホートとの重なりで測ることになる。
+    b_ref = read_scoring_csv(truth_dir / "B_ref.csv")
+    ref_pool = pd.read_csv(truth_dir / "pool_ids_ref.csv")  # record_id, pool_id, is_rare（B_ref行順）
     submitter_pool_set = _pool_set(submitter_pool_path)
 
     confidence = mia_mod.overlap_mia(C, a_bg, b_ref, cfg)
@@ -226,23 +234,27 @@ def score_process(frames: dict[str, pd.DataFrame], ref_dir: Path, cfg: dict,
 # --------------------------------------------------------------------------- #
 # 攻撃採点
 # --------------------------------------------------------------------------- #
-def _attacker_pool(ref_dir: Path, team_id: int | None = None) -> pd.DataFrame:
+def _attacker_pool(truth_dir: Path, team_id: int | None = None) -> pd.DataFrame:
     """攻撃者コホート P の record_id→pool_id/is_rare（F_mia の行キー照合・rare_mask 用）。
 
     練習は固定名 `pool_ids_attacker.csv`。本番は提出者自身のコホート＝`pool_ids_{team_id}.csv`
-    （対象側と同じファイルを兼用できる＝本番参照データに攻撃者専用のコピーを置かなくてよい）。
+    （対象側と同じファイルを兼用できる＝truth_dir に攻撃者専用のコピーを置かなくてよい）。
     """
     name = "pool_ids_attacker.csv" if team_id is None else f"pool_ids_{team_id}.csv"
-    return pd.read_csv(ref_dir / name)  # record_id, pool_id, is_rare
+    return pd.read_csv(truth_dir / name)  # record_id, pool_id, is_rare
 
 
-def score_mia_power(f_mia: pd.DataFrame, ref_dir: Path, cfg: dict, team_id: int | None = None) -> dict:
+def score_mia_power(f_mia: pd.DataFrame, truth_dir: Path, cfg: dict, team_id: int | None = None) -> dict:
     """MIA密行列を採点する。各ターゲット列 k で score_mia を取り、ターゲット平均を power とする。
 
     行キー＝攻撃者コホート P の record_id。列 k のセル＝参加者が申告した membership 確信度。
     真値 O_Pk[r] = pool_id(P 行r) ∈ set(pool_id ∈ target k)。希少 worst-case は score_mia が取る。
+
+    本番モード（`team_id` が解決できたとき）は**提出者自身の標的を平均から外す**。
+    条文（ルールブック §攻撃の測り方）が母数を「自分のチーム以外の全チーム」と定めているため。
+    検証器は自列入りを受理する（提出物を作り直させない）ので、除外はここで行う。
     """
-    attacker_pool = _attacker_pool(ref_dir, team_id)
+    attacker_pool = _attacker_pool(truth_dir, team_id)
     # F_mia の record_id 順に攻撃者 pool を並べ替え（検証器が行キー一致は保証済）
     ap = attacker_pool.set_index("record_id")
     rid = f_mia["record_id"].to_numpy(dtype=int)
@@ -253,6 +265,8 @@ def score_mia_power(f_mia: pd.DataFrame, ref_dir: Path, cfg: dict, team_id: int 
     rare_mask = ap.loc[rid, "is_rare"].to_numpy(dtype=bool) if "is_rare" in ap else None
 
     target_cols = [c for c in f_mia.columns if c != "record_id"]
+    if team_id is not None:
+        target_cols = [c for c in target_cols if int(c) != int(team_id)]
     # ★2026-08-13: 標的別は**実数をやめて 1〜4 の帯**にする。標的別に細かい数値を返すと、
     #   匿名化データを使わずに採点結果だけから答えを絞り込めてしまうため
     #   （詳しくは docs/task_attack_detail_granularity_仕様.md §1）。
@@ -264,7 +278,7 @@ def score_mia_power(f_mia: pd.DataFrame, ref_dir: Path, cfg: dict, team_id: int 
     per_band: dict[str, int] = {}
     for col in target_cols:
         k = int(col)
-        target_set = _pool_set(ref_dir / f"pool_ids_{k}.csv")
+        target_set = _pool_set(truth_dir / f"pool_ids_{k}.csv")
         truth = _membership_truth(cand_pool_ids, target_set)
         conf = pd.to_numeric(f_mia[col], errors="coerce").to_numpy(dtype=float)
         res = attack_score.score_mia(conf, truth, cfg, rare_mask=rare_mask)
@@ -285,9 +299,33 @@ def score_mia_power(f_mia: pd.DataFrame, ref_dir: Path, cfg: dict, team_id: int 
             "auc": _nanmean(per_auc), "per_target_band": per_band}
 
 
-def score_aia_power(f_aia: pd.DataFrame, ref_dir: Path, cfg: dict) -> dict:
+def _aia_floor_by_target(truth_dir: Path) -> dict[int, float]:
+    """truth_dir の `aia_floor.csv`（team_id,aia_floor）を読む。無ければ空＝床0扱い。
+
+    この表は `tokens.csv` と同じ側（事務局の真値ディレクトリ）にしか
+    無い＝参加者の配布物には入らないので全体表が漏れない（09-07の開示方式そのまま）。
+    """
+    path = truth_dir / "aia_floor.csv"
+    if not path.exists():
+        return {}
+    df = pd.read_csv(path)
+    return {int(r["team_id"]): float(r["aia_floor"]) for _, r in df.iterrows()}
+
+
+def score_aia_power(f_aia: pd.DataFrame, truth_dir: Path, cfg: dict, team_id: int | None = None) -> dict:
     """AIAロングを採点する。ターゲット k ごとに aia_truth_k で member/control に割り、
-    score_aia を取り、ターゲット平均を power とする。"""
+    score_aia を取り、ターゲット平均を power とする。
+
+    本番モード（`team_id` が解決できたとき）は**提出者自身の標的を平均から外す**。
+    条文（ルールブック §攻撃の測り方）が母数を「自分のチーム以外の全チーム」と定めているため。
+    検証器は自列入りを受理する（提出物を作り直させない）ので、除外はここで行う。
+
+    ★2026-09-08 追加（§2.5）: AIAの帰無の床を**攻撃力側にも**引く。標的kごとに
+    `score_aia = clip(score_aia - aia_floor[k], 0, 1)` を適用してから平均する（匿名性側の
+    `aggregate_anonymity(aia_floor=...)` と対称）。`truth_dir/aia_floor.csv` が無いときは
+    床0＝従来と同じ挙動（後方一致）。
+    """
+    aia_floor = _aia_floor_by_target(truth_dir)
     # AIA の標的別は従来どおり score の実数を返す（帯にするのは MIA だけ）。
     per_target: dict[str, float] = {}
     per_all: list[float] = []
@@ -297,7 +335,9 @@ def score_aia_power(f_aia: pd.DataFrame, ref_dir: Path, cfg: dict) -> dict:
     per_p_m_rare: list[float] = []
     per_p_c_rare: list[float] = []
     for k, grp in f_aia.groupby(f_aia["target_k"].astype(int)):
-        truth = pd.read_csv(ref_dir / f"aia_truth_{int(k)}.csv")  # challenge_row_id,label,onset,time,is_rare
+        if team_id is not None and int(k) == int(team_id):
+            continue
+        truth = read_scoring_csv(truth_dir / f"aia_truth_{int(k)}.csv")  # challenge_row_id,label,onset,time,is_rare
         merged = grp.merge(truth, on="challenge_row_id", how="inner", suffixes=("", "_truth"))
         is_member = merged["label"].to_numpy() == "member"
         is_control = merged["label"].to_numpy() == "control"
@@ -314,7 +354,8 @@ def score_aia_power(f_aia: pd.DataFrame, ref_dir: Path, cfg: dict) -> dict:
             member_rare_mask=is_rare[is_member],
             control_rare_mask=is_rare[is_control],
         )
-        per_target[str(int(k))] = float(res.score)
+        floored_score = float(np.clip(res.score - aia_floor.get(int(k), 0.0), 0.0, 1.0))
+        per_target[str(int(k))] = floored_score
         per_all.append(float(res.breakdown.get("r_time_all", float("nan"))))
         per_rare.append(float(res.breakdown.get("r_time_rare", float("nan"))))
         per_p_m.append(float(res.breakdown.get("succ_time_member", float("nan"))))
@@ -330,7 +371,7 @@ def score_aia_power(f_aia: pd.DataFrame, ref_dir: Path, cfg: dict) -> dict:
             "p_m_rare": _nanmean(per_p_m_rare), "p_c_rare": _nanmean(per_p_c_rare)}
 
 
-def score_attack(frames: dict[str, pd.DataFrame], ref_dir: Path, cfg: dict,
+def score_attack(frames: dict[str, pd.DataFrame], truth_dir: Path, cfg: dict,
                  team_id: int | None = None) -> dict:
     """攻撃提出（`F_mia.csv`＋`F_aia.csv`）を採点する（攻撃タスク）。
 
@@ -339,9 +380,9 @@ def score_attack(frames: dict[str, pd.DataFrame], ref_dir: Path, cfg: dict,
     `team_id` は**攻撃者自身**の解決に使う（`F_mia` の行キー＝自分のコホートの record_id）。
     対象側の `pool_ids_{k}.csv` / `aia_truth_{k}.csv` は元から k 付きなので変わらない。
     """
-    ref_dir = Path(ref_dir)
-    mia = score_mia_power(frames["F_mia.csv"], ref_dir, cfg, team_id)
-    aia = score_aia_power(frames["F_aia.csv"], ref_dir, cfg)
+    truth_dir = Path(truth_dir)
+    mia = score_mia_power(frames["F_mia.csv"], truth_dir, cfg, team_id)
+    aia = score_aia_power(frames["F_aia.csv"], truth_dir, cfg, team_id)
     return {
         "mia_power": mia["power"],
         "aia_power": aia["power"],

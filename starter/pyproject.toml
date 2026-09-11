@@ -6,7 +6,7 @@ requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
 
 # 採点・検証パスが import するものだけ。版は採点 Docker イメージ
-# (hajimeono/pwscup2026-kit:prelim-attack-20260825) と一対一＝ローカル採点とサーバ採点で
+# (hajimeono/pwscup2026-kit:main-process-20260912) と一対一＝ローカル採点とサーバ採点で
 # 数値が食い違わないようにするための固定。厳密に合わせたい場合は
 # requirements-kit.txt（イメージのロックそのもの）を使ってください。
 dependencies = [

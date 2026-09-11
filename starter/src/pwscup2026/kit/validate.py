@@ -130,7 +130,7 @@ def check_package(zip_path: str | Path, cfg: dict) -> PackageResult:
                 errors.append(f"{name}: 空ファイル")
                 continue
             try:
-                df = pd.read_csv(io.BytesIO(raw), encoding="utf-8")
+                df = submission_schema.read_scoring_csv(io.BytesIO(raw), encoding="utf-8")
             except UnicodeDecodeError:
                 errors.append(f"{name}: UTF-8でデコードできない")
                 continue
@@ -194,8 +194,7 @@ def validate_mia_submission(df: pd.DataFrame, cfg: dict, dist: dict | None = Non
         unknown = [c for c in target_cols if str(c) not in allowed]
         if unknown:
             errors.append(f"F_mia: 未知のターゲット列: {unknown}")
-        # ★過不足の「不足」側: 採点は提出された列だけを平均するため、破れそうな
-        # 標的だけ出すと攻撃力が水増しできる。自チーム分の1列だけは欠けてよい（自己攻撃はしない）。
+        # ★過不足の「不足」側: 自チーム分の1列だけは欠けてよい（自己攻撃はしない）。
         missing = sorted(allowed - {str(c) for c in target_cols}, key=lambda x: int(x))
         if len(missing) > 1:
             errors.append(
@@ -263,10 +262,13 @@ def validate_aia_submission(df: pd.DataFrame, cfg: dict, dist: dict | None = Non
 # オーケストレータ ＋ dist ローダ
 # --------------------------------------------------------------------------- #
 def load_dist(dist_dir: str | Path) -> dict:
-    """配布物から検証に使う参照を読む: mia_columns（ターゲット集合）とAIAチャレンジ集合。"""
+    """配布物から検証に使う参照を読む: mia_columns（ターゲット集合）とAIAチャレンジ集合。
+
+    渡されたディレクトリを読むだけで、置き場所には依存しない。
+    """
     dist_dir = Path(dist_dir)
     # 攻撃側参照の置き場: attacker/（事務局）・participant_data/targets（参加者配布）・
-    # reference_data 直下（サーバ）の3系統を見る。ここを取り違えると mia_columns / challenge が
+    # reference_data 直下（練習）／truth_dir 直下（本番）の3系統を見る。ここを取り違えると mia_columns / challenge が
     # 読めず、ターゲット過不足や行キーの検査が黙って省略される。
     attacker = dist_dir
     for cand in (dist_dir / "attacker", dist_dir / "targets"):
@@ -400,7 +402,7 @@ def check_package_dir(res_dir: str | Path, cfg: dict) -> PackageResult:
             errors.append(f"{name}: 空ファイル")
             continue
         try:
-            df = pd.read_csv(io.BytesIO(raw), encoding="utf-8")
+            df = submission_schema.read_scoring_csv(io.BytesIO(raw), encoding="utf-8")
         except UnicodeDecodeError:
             errors.append(f"{name}: UTF-8でデコードできない")
             continue

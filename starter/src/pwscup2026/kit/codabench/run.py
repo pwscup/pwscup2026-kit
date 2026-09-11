@@ -4,9 +4,13 @@ CodaBench は提出zipを `$input/res/` に、reference_data を `$input/ref/` �
 `command $input $output` を呼ぶ（実測のI/O契約）。本モジュールは:
 
 1. `$input/ref/scoring_config.yaml` から採点cfgを読む（reference_dataに同梱＝driftゼロ）。
-2. `kit.validate.validate_submission_dir` で2層検証（層1で落ちたら層2は走らせない）。
-3. 合格なら `scoring_io.score_process` / `score_attack` を呼ぶ。
-4. `$output/scores.json`（リーダーボード用キー）と `detailed_results.html`（内訳・検証メッセージ）を書く。
+2. **真値は `$input/ref` ではなく `truth_dir` から読む**。
+   `truth_dir` ＝ worker の `/app/data`（＝ホストの `$HOST_DIRECTORY/data` の read-only マウント）に
+   `tokens.csv` があればそこ。無ければ `$input/ref` へフォールバック（練習バンドル・既存の予備戦
+   再走はこの経路＝挙動不変）。環境変数 `PWSCUP_TRUTH_DIR` は明示の上書き（検証・手元の再走用）。
+3. `kit.validate.validate_submission_dir` で2層検証（層1で落ちたら層2は走らせない）。
+4. 合格なら `scoring_io.score_process` / `score_attack` を呼ぶ。
+5. `$output/scores.json`（リーダーボード用キー）と `detailed_results.html`（内訳・検証メッセージ）を書く。
 
 **リーダーボードは汎用6列 `score_1`〜`score_6`**: CodaBench は
 1コンペにLB1つ・scores.json に無いキー列は空欄。加工/攻撃を1コンペに同居させるので、**両方が同じキーを
@@ -36,6 +40,7 @@ shim は scoring_program zip 同梱の3行スクリプト。純関数は焼き�
 from __future__ import annotations
 
 import json
+import os
 import sys
 from html import escape
 from pathlib import Path
@@ -65,8 +70,55 @@ _JA_LABEL = {
 }
 
 
+#: worker の既定マウント。CodaBench は `$HOST_DIRECTORY/data` をここへ read-only で入れる
+#: （公式手順 "Optional: put data directly inside the compute worker"＝採点プログラム側が
+#: このパスを見る形が上流の想定）。**採点コンテナへ任意の環境変数を渡す口が上流に無い**ので
+#: （`compute_worker.py` の `create_container` の `environment` はハードコード）、
+#: この固定パスを既定として自動検出する。
+WORKER_TRUTH_DIR = Path("/app/data")
+
+#: truth_dir かどうかの目印。**本番の真値にだけある**ファイル（練習の参照データには無い）。
+#: `/app/data` は空でも常に存在するので、「存在する」ではなくこれで判定する。
+TRUTH_SENTINEL = "tokens.csv"
+
+#: 真値ディレクトリを明示指定する環境変数（検証・手元の再走用の上書き）。
+TRUTH_DIR_ENV = "PWSCUP_TRUTH_DIR"
+
+
 def _load_cfg(ref_dir: Path) -> dict:
+    """採点cfgは**常に `$input/ref`** から読む（reference_data 同梱＝タスクと drift ゼロ）。
+
+    `PWSCUP_TRUTH_DIR` の有無に関係なくここは `ref_dir`。
+    """
     return yaml.safe_load((ref_dir / "scoring_config.yaml").read_text(encoding="utf-8"))
+
+
+def _resolve_truth_dir(ref_dir: Path) -> Path:
+    """真値の読み元を決める。優先順は 環境変数 → worker の `/app/data` → `ref_dir`。
+
+    1. `PWSCUP_TRUTH_DIR` が**実在するディレクトリ**を指していればそれ（明示の上書き）。
+    2. 無ければ `WORKER_TRUTH_DIR/tokens.csv` があるときだけ `WORKER_TRUTH_DIR`（worker の本番）。
+    3. どちらでもなければ `ref_dir`（従来経路）。
+
+    ★2 の意味: 上流の CodaBench は採点コンテナへ任意の環境変数を渡せないので、
+    **採点コード側が固定パスを見る**のが公式の使い方。`/app/data` は空でも常にマウントされる
+    ので、「存在するか」ではなく `tokens.csv` の有無で本番の真値が置かれたかを判定する。
+
+    ★3 の意味: 練習バンドルと既存の予備戦再走は reference_data に真値が入ったままの形なので、
+    **従来と1バイトも変わらない経路**で動く。本番 worker だけが `/app/data` を読む。
+
+    環境変数が実在しないパスを指す場合も `ref_dir` へ落とすが、本番の ref には真値が無い（slim）
+    ので、採点は黙って別値を出すのではなく **NG／例外で非ゼロ終了**する（合格条件A5）。
+    """
+    raw = os.environ.get(TRUTH_DIR_ENV)
+    if raw:
+        p = Path(raw)
+        if p.is_dir():
+            return p
+        return ref_dir
+    if (WORKER_TRUTH_DIR / TRUTH_SENTINEL).is_file():
+        return WORKER_TRUTH_DIR
+    return ref_dir
 
 
 def _write_outputs(output_dir: Path, scores: dict[str, float], detail_html: str) -> None:
@@ -132,9 +184,9 @@ def _map_to_leaderboard(kind: str, out: dict) -> tuple[dict[str, float], dict[st
     return leaderboard, named, named_keys
 
 
-def _score(kind: str, frames: dict, ref_dir: Path, cfg: dict, team_id: int | None = None) -> dict:
-    return scoring_io.score_process(frames, ref_dir, cfg, team_id) if kind == "defense" \
-        else scoring_io.score_attack(frames, ref_dir, cfg, team_id)
+def _score(kind: str, frames: dict, truth_dir: Path, cfg: dict, team_id: int | None = None) -> dict:
+    return scoring_io.score_process(frames, truth_dir, cfg, team_id) if kind == "defense" \
+        else scoring_io.score_attack(frames, truth_dir, cfg, team_id)
 
 
 def _run(mode: str, input_dir: str, output_dir: str) -> int:
@@ -143,11 +195,13 @@ def _run(mode: str, input_dir: str, output_dir: str) -> int:
     res_dir = in_dir / "res"
     ref_dir = in_dir / "ref"
     out_dir = Path(output_dir)
-    cfg = _load_cfg(ref_dir)
+    cfg = _load_cfg(ref_dir)          # 設定は常に reference_data 側
+    truth_dir = _resolve_truth_dir(ref_dir)  # 真値は truth_dir 側（worker では /app/data）
 
     # 本番は mode 固定（kind_override）、練習は自動判定（kind_override=None）。
+    # ★検証の参照（`tokens.csv`・`mia_columns.json`・チャレンジ集合）も真値側なので dist_dir=truth_dir。
     kind_override = {"process": "defense", "attack": "attack"}.get(mode)
-    result, pkg = validate_submission_dir(res_dir, cfg, dist_dir=ref_dir, kind_override=kind_override)
+    result, pkg = validate_submission_dir(res_dir, cfg, dist_dir=truth_dir, kind_override=kind_override)
     kind = kind_override or pkg.kind
     title = {"process": "加工フェーズ（防御）採点", "attack": "攻撃フェーズ採点"}.get(
         mode, f"練習フェーズ採点（{'防御' if kind == 'defense' else '攻撃' if kind == 'attack' else '種別不明'}）"
@@ -163,13 +217,13 @@ def _run(mode: str, input_dir: str, output_dir: str) -> int:
         print("NG:", "; ".join(errors))
         return 1
 
-    # ★本番参照データ（`tokens.csv` 同梱）なら、提出者を token から解決して参照を選ぶ。
-    #   練習参照データには tokens.csv が無いので team_id=None ＝従来どおりの固定名で読む。
+    # ★本番の真値ディレクトリ（`tokens.csv` 同梱）なら、提出者を token から解決して参照を選ぶ。
+    #   練習の参照データには tokens.csv が無いので team_id=None ＝従来どおりの固定名で読む。
     #   未知トークンは検証層で弾かれるが、二重の保険としてここでも採点に入らずに落とす
     #   （非ゼロ終了＝CodaBench で Failed＝提出回数を消費しない）。2026-08-04。
     team_id: int | None = None
-    if scoring_io.is_production_reference(ref_dir):
-        team_id = scoring_io.resolve_team_id(ref_dir, pkg.token)
+    if scoring_io.is_production_reference(truth_dir):
+        team_id = scoring_io.resolve_team_id(truth_dir, pkg.token)
         if team_id is None:
             msg = ("token.txt が登録されているトークンと一致しません。"
                    "配布物に同梱された token.txt をそのまま提出物に入れてください。")
@@ -178,7 +232,7 @@ def _run(mode: str, input_dir: str, output_dir: str) -> int:
             return 1
 
     try:
-        out = _score(kind, pkg.frames, ref_dir, cfg, team_id)
+        out = _score(kind, pkg.frames, truth_dir, cfg, team_id)
     except Exception as exc:  # noqa: BLE001
         # 採点器の例外でCodaBenchジョブを落とさない（落ちるとrejectにもならず異常終了する）。
         # スコア0＋理由をdetailedに出す。
