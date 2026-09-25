@@ -196,7 +196,18 @@ def validate_mia_submission(df: pd.DataFrame, cfg: dict, dist: dict | None = Non
             errors.append(f"F_mia: 未知のターゲット列: {unknown}")
         # ★過不足の「不足」側: 自チーム分の1列だけは欠けてよい（自己攻撃はしない）。
         missing = sorted(allowed - {str(c) for c in target_cols}, key=lambda x: int(x))
-        if len(missing) > 1:
+        own = dist.get("team_id")
+        if own is not None:
+            # ★提出者が分かる本番では「欠けてよいのは自チームの列だけ」を字面どおりに見る。
+            #   「1列までなら何が欠けてもよい」だと、攻撃対象でない攻撃者や自列を入れた提出が、
+            #   他チームの列を1つ落としても通ってしまう（ルールブック §5.2）。
+            others = [c for c in missing if int(c) != int(own)]
+            if others:
+                errors.append(
+                    f"F_mia: ターゲット列が不足（自チーム以外で{len(others)}列欠落: {others}）。"
+                    "自チーム以外の全標的に答えること"
+                )
+        elif len(missing) > 1:
             errors.append(
                 f"F_mia: ターゲット列が不足（全{len(allowed)}標的中{len(missing)}欠落: {missing}）。"
                 "自チーム以外の全標的に答えること"
@@ -234,6 +245,13 @@ def validate_aia_submission(df: pd.DataFrame, cfg: dict, dist: dict | None = Non
     if np.isnan(tk).any() or not np.allclose(tk[np.isfinite(tk)], np.round(tk[np.isfinite(tk)])):
         errors.append("F_aia[target_k]: 整数でない/欠測がある")
     seen_targets = {int(x) for x in tk[np.isfinite(tk)]}
+    # ★同じ (target_k, challenge_row_id) の重複を落とす。ルールブック §5.2＝「全行に1行ずつ」。
+    #   下の過不足は集合で比べるので重複をすり抜け、採点（aia_truth との inner merge）では二重に数えられる。
+    pair = pd.DataFrame({"k": tk, "r": pd.to_numeric(df["challenge_row_id"], errors="coerce")}).dropna()
+    n_dup = int(pair.duplicated().sum())
+    if n_dup:
+        errors.append(f"F_aia: 同じ (target_k, challenge_row_id) の行が重複している（余分{n_dup}行）。"
+                      "各行に1行ずつ答えること")
     if dist and "mia_columns" in dist:
         allowed = {int(x) for x in dist["mia_columns"]["target_columns"]}
         unknown = seen_targets - allowed
@@ -245,12 +263,24 @@ def validate_aia_submission(df: pd.DataFrame, cfg: dict, dist: dict | None = Non
         for k, r in zip(tk, rid):
             if np.isfinite(k) and pd.notna(r):
                 got.setdefault(int(k), set()).add(int(r))
+        own = dist.get("team_id")
         for k, ids in dist["challenge"].items():
+            # 自チームを対象にした行は採点で除くので、入っていても中身の過不足は問わない（§5.2）。
+            if own is not None and int(k) == int(own):
+                continue
             if k in seen_targets and got.get(k, set()) != ids:
                 errors.append(f"F_aia: target_k={k} のchallenge_row_id集合が配布と不一致（過不足）")
         # ★標的そのものの欠落（F_miaと同じ理由）。自チーム分の1標的は欠けてよい。
         missing_k = sorted(set(dist["challenge"]) - seen_targets)
-        if len(missing_k) > 1:
+        if own is not None:
+            # ★本番は自チーム以外の欠落を1つでも落とす（F_mia と同じ理由）。
+            others_k = [k for k in missing_k if int(k) != int(own)]
+            if others_k:
+                errors.append(
+                    f"F_aia: 標的が不足（自チーム以外で{len(others_k)}標的欠落: {others_k}）。"
+                    "自チーム以外の全標的に答えること"
+                )
+        elif len(missing_k) > 1:
             errors.append(
                 f"F_aia: 標的が不足（全{len(dist['challenge'])}標的中{len(missing_k)}欠落: {missing_k}）。"
                 "自チーム以外の全標的に答えること"
@@ -261,10 +291,39 @@ def validate_aia_submission(df: pd.DataFrame, cfg: dict, dist: dict | None = Non
 # --------------------------------------------------------------------------- #
 # オーケストレータ ＋ dist ローダ
 # --------------------------------------------------------------------------- #
-def load_dist(dist_dir: str | Path) -> dict:
+def is_production_dist(dist_dir: str | Path | None) -> bool:
+    """`dist_dir` が本番の真値ディレクトリか（`tokens.csv` があるか）。
+
+    `scoring_io.is_production_reference` と同じ目印。検証器は採点アダプタ（codabench）に
+    依存しない層なので、同じ判定をここにも置く。
+    """
+    return dist_dir is not None and (Path(dist_dir) / "tokens.csv").is_file()
+
+
+def lookup_team_id(dist_dir: str | Path | None, token: str | None) -> int | None:
+    """本番の真値ディレクトリの `tokens.csv` で token から team_id を引く。練習・未知トークンは None。
+
+    `scoring_io.resolve_team_id` と同じ引き方（前後の空白を落として完全一致・重複時は後の行）。
+    """
+    if token is None or not is_production_dist(dist_dir):
+        return None
+    df = pd.read_csv(Path(dist_dir) / "tokens.csv", dtype={"token": str})
+    hit = pd.to_numeric(df.loc[df["token"].astype(str).str.strip() == str(token).strip(), "team_id"],
+                        errors="coerce").dropna()
+    return int(hit.iloc[-1]) if len(hit) else None
+
+
+def load_dist(dist_dir: str | Path, team_id: int | None = None) -> dict:
     """配布物から検証に使う参照を読む: mia_columns（ターゲット集合）とAIAチャレンジ集合。
 
     渡されたディレクトリを読むだけで、置き場所には依存しない。
+
+    本番の真値ディレクトリはチーム番号つきの名前（`B_{id}.csv`・`pool_ids_{id}.csv`・
+    `aia_truth_{id}.csv`）で、練習用の固定名（`B_practice.csv`・`pool_ids_attacker.csv`・
+    `aia_challenge_*.csv`）を持たない。`team_id`（提出者。`lookup_team_id` で引く）を渡すと、
+    C の行数（|C|==|B_i|）と F_mia の行キーを提出者のチーム番号つきの名前で読む。
+    チャレンジ集合は、`aia_challenge_*.csv` が無ければ `aia_truth_*.csv` の `challenge_row_id` から作る
+    （配布する `aia_challenge_<k>.csv` と同じ集合）。
     """
     dist_dir = Path(dist_dir)
     # 攻撃側参照の置き場: attacker/（事務局）・participant_data/targets（参加者配布）・
@@ -276,15 +335,21 @@ def load_dist(dist_dir: str | Path) -> dict:
             attacker = cand
             break
     d: dict = {}
-    # 防御C_iの期待行数＝配布B_iの行数（|C|==|B_i|強制）。参加者配布(participant_data)・
-    # reference_data ともルート直下に B_practice.csv があるのでそこから拾う。無ければ渡さない
-    # （None→上限のみの後方互換）。
+    if team_id is not None:
+        d["team_id"] = int(team_id)
+    # 防御C_iの期待行数＝配布B_iの行数（|C|==|B_i|強制）。本番は提出者の `B_{id}.csv`、
+    # 練習の参照データ・参加者配布はルート直下の B_practice.csv。無ければ渡さない
+    # （None→上限のみの後方互換。本番で無いときは `production_ref_errors` が落とす）。
     b_practice = dist_dir / "B_practice.csv"
-    if b_practice.exists():
-        d["defense_rows"] = int(len(pd.read_csv(b_practice)))
-    # F_mia の行キー照合用＝攻撃者自身のコホートの record_id 集合。
-    # reference_data には pool_ids_attacker.csv があり、参加者配布では B_practice.csv が同じ集合。
-    for cand in (dist_dir / "pool_ids_attacker.csv", b_practice):
+    b_self = dist_dir / f"B_{int(team_id)}.csv" if team_id is not None else b_practice
+    if b_self.exists():
+        d["defense_rows"] = int(len(pd.read_csv(b_self)))
+    # F_mia の行キー照合用＝攻撃者自身のコホートの record_id 集合。本番は提出者の
+    # `pool_ids_{id}.csv`。練習の reference_data には pool_ids_attacker.csv があり、
+    # 参加者配布では B_practice.csv が同じ集合。
+    pool_cands = ((dist_dir / f"pool_ids_{int(team_id)}.csv",) if team_id is not None
+                  else (dist_dir / "pool_ids_attacker.csv", b_practice))
+    for cand in pool_cands:
         if not cand.exists():
             continue
         _df = pd.read_csv(cand)
@@ -299,6 +364,16 @@ def load_dist(dist_dir: str | Path) -> dict:
     for f in sorted(attacker.glob("aia_challenge_*.csv")):
         k = int(f.stem.rsplit("_", 1)[-1])
         challenge[k] = set(pd.read_csv(f)["challenge_row_id"].astype(int).tolist())
+    if not challenge and is_production_dist(dist_dir):
+        # 本番の真値ディレクトリには配布用の aia_challenge が無い＝答え合わせ用の aia_truth から作る。
+        # 対象は mia_columns.json の標的に限る（それ以外の aia_truth が置かれていても標的に数えない）。
+        targets = ({int(t) for t in d["mia_columns"]["target_columns"]} if "mia_columns" in d else None)
+        for f in sorted(dist_dir.glob("aia_truth_*.csv")):
+            suffix = f.stem.rsplit("_", 1)[-1]
+            if not suffix.isdigit() or (targets is not None and int(suffix) not in targets):
+                continue
+            challenge[int(suffix)] = set(
+                pd.read_csv(f, usecols=["challenge_row_id"])["challenge_row_id"].astype(int).tolist())
     if challenge:
         d["challenge"] = challenge
     # 希少検出の公開参照（schema.json 同梱）＝提出前の自己確認(機能#2)用。participant_data 直下か
@@ -313,6 +388,37 @@ def load_dist(dist_dir: str | Path) -> dict:
                 d["rare_detector"] = sj["rare_detector"]
             break
     return d
+
+
+def production_ref_errors(kind: str | None, dist_dir: str | Path | None, dist: dict | None) -> list[str]:
+    """本番で、提出者の検証に要る参照が揃っていなければ理由を返す（揃っていれば空）。
+
+    本番（`tokens.csv` がある真値ディレクトリ）で参照が見つからないときは、検査を黙って省かずに
+    **検証で落とす**（Failed＝提出回数を消費しない・ルールブック §5.5）。黙って省くと、
+    行数や行キーの検査が効いていないことに気づけないため。
+    提出者が解決できない（未知トークン）ときは `check_token_registered` が先に落とすので何もしない。
+    練習・参加者の手元（`tokens.csv` が無い）も何もしない。
+    """
+    if not is_production_dist(dist_dir) or not dist or "team_id" not in dist:
+        return []
+    k = dist["team_id"]
+    missing: list[str] = []
+    if kind == "defense":
+        if "defense_rows" not in dist:
+            missing.append(f"B_{k}.csv")
+    elif kind == "attack":
+        if "attacker_record_ids" not in dist:
+            missing.append(f"pool_ids_{k}.csv")
+        if "mia_columns" not in dist:
+            missing.append("mia_columns.json")
+        else:
+            have = set((dist.get("challenge") or {}).keys())
+            lack = sorted(int(t) for t in dist["mia_columns"]["target_columns"] if int(t) not in have)
+            missing += [f"aia_truth_{t}.csv" for t in lack]
+    if not missing:
+        return []
+    return [f"採点側の参照データが見つからないため検証できません（{', '.join(missing)}）。"
+            "提出物の問題ではありません。事務局へ連絡してください"]
 
 
 def rare_count_diagnostic(c_df: pd.DataFrame, dist: dict | None) -> dict | None:
@@ -340,8 +446,10 @@ def validate_submission_zip(
         return ValidationResult(False, list(pkg.errors))
 
     kind = kind_override or pkg.kind
-    dist = load_dist(dist_dir) if dist_dir else None
-    errors = list(pkg.errors)
+    team_id = lookup_team_id(dist_dir, pkg.token) if dist_dir else None
+    dist = load_dist(dist_dir, team_id) if dist_dir else None
+    errors = list(pkg.errors) + check_token_registered(pkg.token, dist_dir) \
+        + production_ref_errors(kind, dist_dir, dist)
     if kind == "defense":
         n_exp = dist.get("defense_rows") if dist else None
         errors += submission_schema.validate_c_submission(pkg.frames["C.csv"], cfg, n_expected=n_exp).errors
@@ -477,9 +585,11 @@ def validate_submission_dir(
     if not pkg.ok:
         return ValidationResult(False, list(pkg.errors)), pkg
     kind = kind_override or pkg.kind
-    dist = load_dist(dist_dir) if dist_dir else None
+    # ★本番は提出者（token→team_id）を先に決め、その参照で行数・行キーを見る（`load_dist`）。
+    team_id = lookup_team_id(dist_dir, pkg.token) if dist_dir else None
+    dist = load_dist(dist_dir, team_id) if dist_dir else None
     errors = list(pkg.errors) + check_token_registered(pkg.token, dist_dir) \
-        + _run_layer2(kind, pkg.frames, cfg, dist)
+        + production_ref_errors(kind, dist_dir, dist) + _run_layer2(kind, pkg.frames, cfg, dist)
     return ValidationResult(len(errors) == 0, errors), pkg
 
 
